@@ -10,8 +10,8 @@
 #include <unistd.h>
 #include <vector>
 
-#include <mysql.h>
-#include <mysql/mysqld_error.h>
+#include "mysql.h"
+#include "mysqld_error.h"
 
 #include "tap.h"
 #include "command_line.h"
@@ -20,18 +20,6 @@
 using std::string;
 
 std::size_t supported_metrics = 121;
-
-std::size_t count_matches(const std::string& str, const std::string& substr) {
-	std::size_t result = 0;
-	std::size_t pos = 0;
-
-	while ((pos = str.find(substr, pos)) != std::string::npos) {
-		result += 1;
-		pos += substr.length();
-	}
-
-	return result;
-}
 
 int main(int argc, char** argv) {
 	CommandLine cl;

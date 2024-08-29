@@ -1,7 +1,10 @@
 #include "proxysql.h"
 #include "cpp.h"
 
+#ifndef SPOOKYV2
 #include "SpookyV2.h"
+#define SPOOKYV2
+#endif
 
 #include "MySQL_PreparedStatement.h"
 #include "MySQL_Protocol.h"
@@ -12,6 +15,8 @@
 //#else
 extern MySQL_STMT_Manager_v14 *GloMyStmt;
 //#endif
+
+const int PS_GLOBAL_STATUS_FIELD_NUM = 9;
 
 static uint64_t stmt_compute_hash(char *user,
                                   char *schema, char *query,
@@ -137,6 +142,7 @@ MySQL_STMT_Global_info::MySQL_STMT_Global_info(uint64_t id,
                                                char *fc,
                                                MYSQL_STMT *stmt, uint64_t _h) {
 	pthread_rwlock_init(&rwlock_, NULL);
+	total_mem_usage = 0;
 	statement_id = id;
 	ref_count_client = 0;
 	ref_count_server = 0;
@@ -291,6 +297,33 @@ __exit_MySQL_STMT_Global_info___search_select:
 			memset(params[i], 0, sizeof(MYSQL_BIND));
 		}
 	}
+
+	calculate_mem_usage();
+}
+
+void MySQL_STMT_Global_info::calculate_mem_usage() {
+	total_mem_usage = sizeof(MySQL_STMT_Global_info) +
+		(num_params * (sizeof(MYSQL_BIND) + sizeof(MYSQL_BIND*))) +
+		(num_columns * (sizeof(MYSQL_FIELD) + sizeof(MYSQL_FIELD*))) +
+		query_length + 1;// +
+		//(ref_count_client * 24) +
+		//(ref_count_server * 24);
+
+	if (username) total_mem_usage += strlen(username) + 1;
+	if (schemaname) total_mem_usage += strlen(schemaname) + 1;
+	if (first_comment) total_mem_usage += strlen(first_comment) + 1;
+	if (digest_text) total_mem_usage += strlen(digest_text) + 1;
+
+	for (uint16_t i = 0; i < num_columns; i++) {
+		const MYSQL_FIELD* fd = fields[i];
+		if (fd->name) total_mem_usage += strlen(fd->name) + 1;
+		if (fd->org_name) total_mem_usage += strlen(fd->org_name) + 1;
+		if (fd->table) total_mem_usage += strlen(fd->table) + 1;
+		if (fd->org_table) total_mem_usage += strlen(fd->org_table) + 1;
+		if (fd->db) total_mem_usage += strlen(fd->db) + 1;
+		if (fd->catalog) total_mem_usage += strlen(fd->catalog) + 1;
+		if (fd->def) total_mem_usage += strlen(fd->def) + 1;
+	}
 }
 
 void MySQL_STMT_Global_info::update_metadata(MYSQL_STMT *stmt) {
@@ -385,7 +418,11 @@ void MySQL_STMT_Global_info::update_metadata(MYSQL_STMT *stmt) {
 		}
 	}
 	if (need_refresh) {
-		proxy_warning("Updating metadata for stmt %lu , user %s, query %s\n", statement_id, username, query);
+		if (digest_text && strncasecmp(digest_text, "EXPLAIN", strlen("EXPLAIN"))==0) {
+			// do not print any message in case of EXPLAIN
+		} else {
+			proxy_warning("Updating metadata for stmt %lu , user %s, query %s\n", statement_id, username, query);
+		}
 // from here is copied from destructor
 		if (num_columns) {
 			uint16_t i;
@@ -475,6 +512,7 @@ void MySQL_STMT_Global_info::update_metadata(MYSQL_STMT *stmt) {
 			}
 		}
 // till here is copied from constructor
+		calculate_mem_usage();
 	}
 	pthread_rwlock_unlock(&rwlock_);
 }
@@ -578,6 +616,10 @@ MySQL_STMT_Manager_v14::MySQL_STMT_Manager_v14() {
 }
 
 MySQL_STMT_Manager_v14::~MySQL_STMT_Manager_v14() {
+	for (auto it = map_stmt_id_to_info.begin(); it != map_stmt_id_to_info.end(); ++it) {
+		MySQL_STMT_Global_info * a = it->second;
+		delete a;
+	}
 }
 
 void MySQL_STMT_Manager_v14::ref_count_client(uint64_t _stmt_id ,int _v, bool lock) {
@@ -696,53 +738,16 @@ MySQL_STMTs_local_v14::~MySQL_STMTs_local_v14() {
 			GloMyStmt->ref_count_server(global_stmt_id, -1);
 		}
 	}
-/*
-	for (std::map<uint32_t, MYSQL_STMT *>::iterator it = m.begin();
-	     it != m.end(); ++it) {
-		uint32_t stmt_id = it->first;
-		MYSQL_STMT *stmt = it->second;
-		if (stmt) {  // is a server
-			if (stmt->mysql) {
-				stmt->mysql->stmts =
-				    list_delete(stmt->mysql->stmts, &stmt->list);
-			}
-			// we do a hack here: we pretend there is no server associate
-			// the connection will be dropped anyway immediately after
-			stmt->mysql = NULL;
-			mysql_stmt_close(stmt);
-			GloMyStmt->ref_count(stmt_id, -1, true, false);
-		} else {  // is a client
-			GloMyStmt->ref_count(stmt_id, -1, true, true);
-		}
-	}
-	m.erase(m.begin(), m.end());
-*/
 }
 
 
 MySQL_STMT_Global_info *MySQL_STMT_Manager_v14::find_prepared_statement_by_hash(
     uint64_t hash) {
-    //uint64_t hash, bool lock) { // removed in 2.3
 	MySQL_STMT_Global_info *ret = NULL;  // assume we do not find it
-/* removed in 2.3
-	if (lock) {
-		pthread_rwlock_wrlock(&rwlock_);
-	}
-*/
 	auto s = map_stmt_hash_to_info.find(hash);
 	if (s != map_stmt_hash_to_info.end()) {
 		ret = s->second;
-		//__sync_fetch_and_add(&ret->ref_count_client,1); // increase reference
-		//count
-//		__sync_fetch_and_add(&find_prepared_statement_by_hash_calls, 1);
-//		__sync_fetch_and_add(&ret->ref_count_client, 1);
 	}
-
-/* removed in 2.3
-	if (lock) {
-		pthread_rwlock_unlock(&rwlock_);
-	}
-*/
 	return ret;
 }
 
@@ -766,15 +771,6 @@ MySQL_STMT_Global_info *MySQL_STMT_Manager_v14::find_prepared_statement_by_stmt_
 
 uint32_t MySQL_STMTs_local_v14::generate_new_client_stmt_id(uint64_t global_statement_id) {
 	uint32_t ret=0;
-/*
-	//auto s2 = global_stmt_to_client_ids.find(global_statement_id);
-	std::pair<std::multimap<uint64_t,uint32_t>::iterator, std::multimap<uint64_t,uint32_t>::iterator> itret;
-	itret = global_stmt_to_client_ids.equal_range(global_statement_id);
-	for (std::multimap<uint64_t,uint32_t>::iterator it=itret.first; it!=itret.second; ++it) {
-		ret = it->second;
-		return ret;
-	}
-*/
 	if (free_client_ids.size()) {
 		ret=free_client_ids.top();
 		free_client_ids.pop();
@@ -851,7 +847,6 @@ MySQL_STMT_Global_info *MySQL_STMT_Manager_v14::add_prepared_statement(
 		} else {
 			next_id = next_statement_id;
 			next_statement_id++;
-			//__sync_fetch_and_add(&next_statement_id, 1);
 		}
 
 		//next_statement_id++;
@@ -860,14 +855,7 @@ MySQL_STMT_Global_info *MySQL_STMT_Manager_v14::add_prepared_statement(
 		// insert it in both maps
 		map_stmt_id_to_info.insert(std::make_pair(a->statement_id, a));
 		map_stmt_hash_to_info.insert(std::make_pair(a->hash, a));
-		// ret=a->statement_id;
 		ret = a;
-		// next_statement_id++;	// increment it
-		//__sync_fetch_and_add(&ret->ref_count_client,1); // increase reference
-		//count
-//		__sync_fetch_and_add(&ret->ref_count_client,
-//		                     1);  // increase reference count
-//		*is_new = true;
 		__sync_add_and_fetch(&num_stmt_with_ref_client_count_zero,1);
 		__sync_add_and_fetch(&num_stmt_with_ref_server_count_zero,1);
 	}
@@ -876,13 +864,37 @@ MySQL_STMT_Global_info *MySQL_STMT_Manager_v14::add_prepared_statement(
 	}
 	ret->ref_count_server++;
 	statuses.s_total++;
-//	__sync_fetch_and_add(&add_prepared_statement_calls, 1);
-//	__sync_fetch_and_add(&ret->ref_count_server,
-//	                     1);  // increase reference count
 	if (lock) {
 		pthread_rwlock_unlock(&rwlock_);
 	}
 	return ret;
+}
+
+
+void MySQL_STMT_Manager_v14::get_memory_usage(uint64_t& prep_stmt_metadata_mem_usage, uint64_t& prep_stmt_backend_mem_usage) {
+	prep_stmt_backend_mem_usage = 0;
+	prep_stmt_metadata_mem_usage = sizeof(MySQL_STMT_Manager_v14);
+	rdlock();	
+	prep_stmt_metadata_mem_usage += map_stmt_id_to_info.size() * (sizeof(uint64_t) + sizeof(MySQL_STMT_Global_info*));
+	prep_stmt_metadata_mem_usage += map_stmt_hash_to_info.size() * (sizeof(uint64_t) + sizeof(MySQL_STMT_Global_info*));
+	prep_stmt_metadata_mem_usage += free_stmt_ids.size() * (sizeof(uint64_t));
+	for (const auto& keyval : map_stmt_id_to_info) {
+		const MySQL_STMT_Global_info* stmt_global_info = keyval.second;
+		prep_stmt_metadata_mem_usage += stmt_global_info->total_mem_usage;
+		prep_stmt_metadata_mem_usage += stmt_global_info->ref_count_server *
+			((stmt_global_info->num_params * sizeof(MYSQL_BIND)) +
+			(stmt_global_info->num_columns * sizeof(MYSQL_FIELD))) + 16; // ~16 bytes of memory utilized by global_stmt_id and stmt_id mappings
+		prep_stmt_metadata_mem_usage += stmt_global_info->ref_count_client *
+			((stmt_global_info->num_params * sizeof(MYSQL_BIND)) +
+			(stmt_global_info->num_columns * sizeof(MYSQL_FIELD))) + 16; // ~16 bytes of memory utilized by global_stmt_id and stmt_id mappings
+
+		// backend
+		prep_stmt_backend_mem_usage += stmt_global_info->ref_count_server * (sizeof(MYSQL_STMT) +
+			56 + //sizeof(MADB_STMT_EXTENSION)
+			(stmt_global_info->num_params * sizeof(MYSQL_BIND)) + 
+			(stmt_global_info->num_columns * sizeof(MYSQL_FIELD)));
+	}
+	unlock();
 }
 
 void MySQL_STMT_Manager_v14::get_metrics(uint64_t *c_unique, uint64_t *c_total,
@@ -972,7 +984,7 @@ class PS_global_stats {
 	}
 	char **get_row() {
 		char buf[128];
-		char **pta=(char **)malloc(sizeof(char *)*9);
+		char **pta=(char **)malloc(sizeof(char *)*PS_GLOBAL_STATUS_FIELD_NUM);
 		sprintf(buf,"%lu",statement_id);
 		pta[0]=strdup(buf);
 		assert(schemaname);
@@ -998,7 +1010,7 @@ class PS_global_stats {
 	}
 	void free_row(char **pta) {
 		int i;
-		for (i=0;i<7;i++) {
+		for (i=0;i<PS_GLOBAL_STATUS_FIELD_NUM;i++) {
 			assert(pta[i]);
 			free(pta[i]);
 		}
@@ -1009,7 +1021,7 @@ class PS_global_stats {
 
 SQLite3_result * MySQL_STMT_Manager_v14::get_prepared_statements_global_infos() {
 	proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 4, "Dumping current prepared statements global info\n");
-	SQLite3_result *result=new SQLite3_result(9);
+	SQLite3_result *result=new SQLite3_result(PS_GLOBAL_STATUS_FIELD_NUM);
 	rdlock();
 	result->add_column_definition(SQLITE_TEXT,"stmt_id");
 	result->add_column_definition(SQLITE_TEXT,"schemaname");
@@ -1032,14 +1044,6 @@ SQLite3_result * MySQL_STMT_Manager_v14::get_prepared_statements_global_infos() 
 			pgs->free_row(pta);
 			delete pgs;
 	}
-/*
-	for (std::unordered_map<uint64_t, void *>::iterator it=digest_umap.begin(); it!=digest_umap.end(); ++it) {
-		QP_query_digest_stats *qds=(QP_query_digest_stats *)it->second;
-		char **pta=qds->get_row();
-		result->add_row(pta);
-		qds->free_row(pta);
-	}
-*/
 	unlock();
 	return result;
 }

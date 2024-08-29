@@ -1,8 +1,8 @@
 #ifndef __CLASS_MYSQL_THREAD_H
 #define __CLASS_MYSQL_THREAD_H
 #define ____CLASS_STANDARD_MYSQL_THREAD_H
-#include <prometheus/counter.h>
-#include <prometheus/gauge.h>
+#include "prometheus/counter.h"
+#include "prometheus/gauge.h"
 
 #include "proxysql.h"
 #include "cpp.h"
@@ -14,6 +14,8 @@
 
 #include "prometheus_helpers.h"
 
+#include "set_parser.h"
+
 #define MIN_POLL_LEN 8
 #define MIN_POLL_DELETE_RATIO  8
 #define MY_EPOLL_THREAD_MAXEVENTS 128
@@ -23,7 +25,6 @@
 #define SQLITE_HOSTGROUP -4
 
 
-#define MYSQL_DEFAULT_TX_ISOLATION	"READ-COMMITTED"
 #define MYSQL_DEFAULT_SESSION_TRACK_GTIDS      "OFF"
 #define MYSQL_DEFAULT_COLLATION_CONNECTION	""
 #define MYSQL_DEFAULT_NET_WRITE_TIMEOUT	"60"
@@ -50,31 +51,6 @@ typedef struct _kill_queue_t {
 	std::vector<thr_id_usr *> conn_ids;
 	std::vector<thr_id_usr *> query_ids;
 } kill_queue_t;
-
-class ProxySQL_Poll {
-	private:
-	void shrink();
-	void expand(unsigned int more);
-
-	public:
-	unsigned int poll_timeout;
-	unsigned long loops;
-	StatCounters *loop_counters;
-	unsigned int len;
-	unsigned int size;
-	struct pollfd *fds;
-	MySQL_Data_Stream **myds;
-	unsigned long long *last_recv;
-	unsigned long long *last_sent;
-	volatile int pending_listener_add;
-	volatile int pending_listener_del;
-
-	ProxySQL_Poll();
-	~ProxySQL_Poll();
-	void add(uint32_t _events, int _fd, MySQL_Data_Stream *_myds, unsigned long long sent_time);
-	void remove_index_fast(unsigned int i);
-	int find_index(int fd);
-};
 
 enum MySQL_Thread_status_variable {
 	st_var_backend_stmt_prepare,
@@ -122,7 +98,7 @@ enum MySQL_Thread_status_variable {
 	st_var_END
 };
 
-class MySQL_Thread
+class __attribute__((aligned(64))) MySQL_Thread
 {
 	private:
 	unsigned int servers_table_version_previous;
@@ -153,6 +129,7 @@ class MySQL_Thread
 	void idle_thread_prepares_session_to_send_to_worker_thread(int i);
 	void idle_thread_to_kill_idle_sessions();
 	bool move_session_to_idle_mysql_sessions(MySQL_Data_Stream *myds, unsigned int n);
+	void run_Handle_epoll_wait(int);
 #endif // IDLE_THREADS
 
 	unsigned int find_session_idx_in_mysql_sessions(MySQL_Session *sess);
@@ -165,6 +142,13 @@ class MySQL_Thread
 	void tune_timeout_for_myds_needs_pause(MySQL_Data_Stream *myds);
 	void tune_timeout_for_session_needs_pause(MySQL_Data_Stream *myds);
 	void configure_pollout(MySQL_Data_Stream *myds, unsigned int n);
+
+	void run_MoveSessionsBetweenThreads();
+	void run_BootstrapListener();
+	int run_ComputePollTimeout();
+	void run_StopListener();
+	void run_SetAllSession_ToProcess0();
+
 
 	protected:
 	int nfds;
@@ -213,11 +197,15 @@ class MySQL_Thread
 		bool query_cache_stores_empty_result;
 	} variables;
 
-  pthread_mutex_t thread_mutex;
-  MySQL_Thread();
-  ~MySQL_Thread();
-  MySQL_Session * create_new_session_and_client_data_stream(int _fd);
-  bool init();
+	pthread_mutex_t thread_mutex;
+
+	// if set_parser_algorithm == 2 , a single thr_SetParser is used
+	SetParser *thr_SetParser;
+
+	MySQL_Thread();
+	~MySQL_Thread();
+	MySQL_Session * create_new_session_and_client_data_stream(int _fd);
+	bool init();
 	void run___get_multiple_idle_connections(int& num_idles);
 	void run___cleanup_mirror_queue();
   	void ProcessAllMyDS_BeforePoll();
@@ -232,6 +220,7 @@ class MySQL_Thread
 	void ProcessAllSessions_SortingSessions();
 	void ProcessAllSessions_CompletedMirrorSession(unsigned int& n, MySQL_Session *sess);
 	void ProcessAllSessions_MaintenanceLoop(MySQL_Session *sess, unsigned long long sess_time, unsigned int& total_active_transactions_);
+	void ProcessAllSessions_Healthy0(MySQL_Session *sess, unsigned int& n);
 	void process_all_sessions();
   void refresh_variables();
   void register_session_connection_handler(MySQL_Session *_sess, bool _new=false);
@@ -248,25 +237,6 @@ class MySQL_Thread
 
 typedef MySQL_Thread * create_MySQL_Thread_t();
 typedef void destroy_MySQL_Thread_t(MySQL_Thread *);
-
-class iface_info {
-	public:
-	char *iface;
-	char *address;
-	int port;
-	int fd;
-	iface_info(char *_i, char *_a, int p, int f) {
-		iface=strdup(_i);
-		address=strdup(_a);
-		port=p;
-		fd=f;
-	}
-	~iface_info() {
-		free(iface);
-		free(address);
-		close(fd);
-	}
-};
 
 class MySQL_Listeners_Manager {
 	private:
@@ -288,8 +258,6 @@ struct p_th_counter {
 		queries_backends_bytes_recv,
 		queries_frontends_bytes_sent,
 		queries_frontends_bytes_recv,
-		client_connections_created,
-		client_connections_aborted,
 		query_processor_time_nsec,
 		backend_query_time_nsec,
 		com_backend_stmt_prepare,
@@ -345,9 +313,11 @@ struct p_th_gauge {
 		mysql_monitor_ping_interval,
 		mysql_monitor_ping_timeout,
 		mysql_monitor_ping_max_failures,
+		mysql_monitor_aws_rds_topology_discovery_interval,
 		mysql_monitor_read_only_interval,
 		mysql_monitor_read_only_timeout,
 		mysql_monitor_writer_is_also_reader,
+		mysql_monitor_replication_lag_group_by_host,
 		mysql_monitor_replication_lag_interval,
 		mysql_monitor_replication_lag_timeout,
 		mysql_monitor_history,
@@ -425,6 +395,8 @@ class MySQL_Threads_Handler
 		int monitor_ping_max_failures;
 		//! Monitor ping timeout. Unit: 'ms'.
 		int monitor_ping_timeout;
+		//! Monitor aws rds topology discovery interval. Unit: 'one discovery check per X monitor_read_only checks'.
+		int monitor_aws_rds_topology_discovery_interval;
 		//! Monitor read only timeout. Unit: 'ms'.
 		int monitor_read_only_interval;
 		//! Monitor read only timeout. Unit: 'ms'.
@@ -434,6 +406,7 @@ class MySQL_Threads_Handler
 		//! ProxySQL session wait timeout. Unit: 'ms'.
 		bool monitor_wait_timeout;
 		bool monitor_writer_is_also_reader;
+		bool monitor_replication_lag_group_by_host;
 		//! How frequently a replication lag check is performed. Unit: 'ms'.
 		int monitor_replication_lag_interval;
 		//! Read only check timeout. Unit: 'ms'.
@@ -453,6 +426,9 @@ class MySQL_Threads_Handler
 		int monitor_threads_min;
 		int monitor_threads_max;
 		int monitor_threads_queue_maxsize;
+		int monitor_local_dns_cache_ttl;
+		int monitor_local_dns_cache_refresh_interval;
+		int monitor_local_dns_resolver_queue_maxsize;
 		char *monitor_username;
 		char *monitor_password;
 		char * monitor_replication_lag_use_percona_heartbeat;
@@ -483,8 +459,10 @@ class MySQL_Threads_Handler
 		char *interfaces;
 		char *server_version;
 		char *keep_multiplexing_variables;
+		char *default_authentication_plugin;
 		//unsigned int default_charset; // removed in 2.0.13 . Obsoleted previously using MySQL_Variables instead
 		int handle_unknown_charset;
+		int default_authentication_plugin_int;
 		bool servers_stats;
 		bool commands_stats;
 		bool query_digests;
@@ -496,6 +474,7 @@ class MySQL_Threads_Handler
 		bool query_digests_keep_comment;
 		int query_digests_grouping_limit;
 		int query_digests_groups_grouping_limit;
+		bool parse_failure_logs_digest;
 		bool default_reconnect;
 		bool have_compress;
 		bool have_ssl;
@@ -518,6 +497,7 @@ class MySQL_Threads_Handler
 		int threshold_resultset_size;
 		int query_digests_max_digest_length;
 		int query_digests_max_query_length;
+		int query_rules_fast_routing_algorithm;
 		int wait_timeout;
 		int throttle_max_bytes_per_second_to_client;
 		int throttle_ratio_server_to_client;
@@ -532,15 +512,16 @@ class MySQL_Threads_Handler
 		int query_processor_iterations;
 		int query_processor_regex;
 		int set_query_lock_on_hostgroup;
+		int set_parser_algorithm;
 		int reset_connection_algorithm;
 		int auto_increment_delay_multiplex;
+		int auto_increment_delay_multiplex_timeout_ms;
 		int long_query_time;
 		int hostgroup_manager_verbose;
 		int binlog_reader_connect_retry_msec;
 		char *init_connect;
 		char *ldap_user_variable;
 		char *add_ldap_user_comment;
-		char *default_tx_isolation;
 		char *default_session_track_gtids;
 		char *default_variables[SQL_NAME_LAST_LOW_WM];
 		char *firewall_whitelist_errormsg;
@@ -566,6 +547,8 @@ class MySQL_Threads_Handler
 		char * ssl_p2s_crl;
 		char * ssl_p2s_crlpath;
 		int query_cache_size_MB;
+		int query_cache_soft_ttl_pct;
+		int query_cache_handle_warnings;
 		int min_num_servers_lantency_awareness;
 		int aurora_max_lag_ms_only_read_from_replicas;
 		bool stats_time_backend_query;
@@ -577,6 +560,9 @@ class MySQL_Threads_Handler
 		bool enable_server_deprecate_eof;
 		bool enable_load_data_local_infile;
 		bool log_mysql_warnings_enabled;
+		int data_packets_history_size;
+		int handle_warnings;
+		int evaluate_replication_lag_on_servers_load;
 	} variables;
 	struct {
 		unsigned int mirror_sessions_current;

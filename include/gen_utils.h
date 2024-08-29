@@ -1,6 +1,10 @@
 #ifndef __CLASS_PTR_ARRAY_H
 #define __CLASS_PTR_ARRAY_H
+
+#include <memory>
+#include <queue>
 #include "proxysql.h"
+#include "sqlite3db.h"
 
 #define MIN_ARRAY_LEN 8
 #define MIN_ARRAY_DELETE_RATIO  8
@@ -88,7 +92,7 @@ class PtrArray {
 	void * remove_index(unsigned int i) {
 		void *r=pdata[i];
 		if (i != (len-1)) {
-			memmove(pdata+(i)*sizeof(void *),pdata+(i+1)*sizeof(void *),(len-i-1)*sizeof(void *));
+			memmove((void **)pdata+i,(void **)pdata+i+1,(len-i-1)*sizeof(void *));
 		}
 		len--;
 		if ( ( len>MIN_ARRAY_LEN ) && ( size > len*MIN_ARRAY_DELETE_RATIO ) ) {
@@ -185,6 +189,86 @@ class PtrSizeArray {
 		return intsize;
 	}
 };
+
+struct buffer_t {
+	void * data = nullptr;
+	size_t len = 0;
+	size_t capacity = 0;
+};
+
+class FixedSizeQueue : public std::queue<buffer_t> {
+private:
+	using std::queue<buffer_t>::push;
+	using std::queue<buffer_t>::emplace;
+	using std::queue<buffer_t>::swap;
+	size_t _max_size = 0;
+
+public:
+	FixedSizeQueue() = default;
+	FixedSizeQueue(size_t max_size) : _max_size(max_size) {}
+	~FixedSizeQueue() {
+		while (empty() == false) {
+			auto& node = front();
+			l_free(node.len, node.data);
+			pop();
+		}
+	}
+	
+	inline
+	size_t get_max_size() const {
+		return _max_size;
+	}
+
+	void set_max_size(size_t max_size) {
+		if (_max_size == max_size)
+			return;
+
+		_max_size = max_size;
+
+		if (size() > max_size) {
+			while (size() != max_size) {
+				auto& node = front();
+				l_free(node.len, node.data);
+				pop();
+			}
+		}
+	}
+
+	// using template here to create compile-time separate definition of push, one for true and one for false
+	template<bool ALLOC_MEM = true>
+	void push(void* buff, size_t len) {
+		if (_max_size == 0) return;
+		assert(buff && len);
+
+		buffer_t mybuff;
+
+		if (size() == _max_size) {
+			mybuff = front();
+			pop();
+		}
+
+		if (ALLOC_MEM == true) {
+			if (mybuff.capacity < len) {
+				if (mybuff.data) free(mybuff.data);
+
+				mybuff.data = l_alloc(len);
+				mybuff.capacity = len;
+			}
+
+			memcpy(mybuff.data, buff, len);
+			mybuff.len = len;
+
+		} else {
+			if (mybuff.data) free(mybuff.data);
+
+			mybuff.data = buff;
+			mybuff.capacity = mybuff.len = len;
+		}
+
+		emplace(mybuff);
+	}
+};
+
 #endif /* __CLASS_PTR_ARRAY_H */
 
 
@@ -240,3 +324,13 @@ int remove_spaces(const char *);
 char *trim_spaces_in_place(char *str);
 char *trim_spaces_and_quotes_in_place(char *str);
 bool mywildcmp(const char *p, const char *str);
+std::string trim(const std::string& s);
+
+/**
+ * @brief Helper function that converts a MYSQL_RES into a 'SQLite3_result'.
+ * @param resultset The resultset to be converted into a 'SQLite3_result'.
+ * @return An 'unique_ptr' holding the resulting 'SQLite3_result'.
+ */
+std::unique_ptr<SQLite3_result> get_SQLite3_resulset(MYSQL_RES* resultset);
+
+std::vector<std::string> split_string(const std::string& str, char delimiter);

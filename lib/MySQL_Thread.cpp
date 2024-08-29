@@ -1,11 +1,14 @@
 //#define __CLASS_STANDARD_MYSQL_THREAD_H
+
+#include <functional>
+#include <vector>
+
 #include "MySQL_HostGroups_Manager.h"
 #include "prometheus_helpers.h"
 #define MYSQL_THREAD_IMPLEMENTATION
 #include "proxysql.h"
 #include "cpp.h"
 #include "MySQL_Thread.h"
-#include "SpookyV2.h"
 #include <dirent.h>
 #include <libgen.h>
 #include "re2/re2.h"
@@ -16,6 +19,11 @@
 #include "StatCounters.h"
 #include "MySQL_PreparedStatement.h"
 #include "MySQL_Logger.hpp"
+
+#include <fcntl.h>
+
+using std::vector;
+using std::function;
 
 #ifdef DEBUG
 MySQL_Session *sess_stopat;
@@ -29,6 +37,70 @@ MySQL_Session *sess_stopat;
 
 #define PROXYSQL_LISTEN_LEN 1024
 #define MIN_THREADS_FOR_MAINTENANCE 8
+
+/**
+ * @brief Helper macro to stringify a macro argument.
+ * 
+ * This macro takes a single argument 'x' and converts it into a string literal.
+ * It is a helper macro used by the STRINGIFY macro.
+ * 
+ * @param x The macro argument to be converted into a string.
+ * @return The string representation of the macro argument.
+ */
+#define STRINGIFY_HELPER(x) #x
+
+/**
+ * @brief Macro to stringify a macro argument.
+ * 
+ * This macro takes a single argument 'x' and converts it into a string literal
+ * using the STRINGIFY_HELPER macro.
+ * 
+ * @param x The macro argument to be converted into a string.
+ * @return The string representation of the macro argument.
+ */
+#define STRINGIFY(x) STRINGIFY_HELPER(x)
+
+/**
+ * @brief Refreshes a boolean variable from the MySQL thread.
+ * 
+ * This macro updates the value of a boolean variable named 'name' from
+ * the MySQL thread. It retrieves the value using the 'get_variable_int' function
+ * from the 'GloMTH' object and assigns it to the variable 'mysql_thread___name'.
+ * The retrieved integer value is cast to a boolean before assignment.
+ * 
+ * @param name The name of the boolean variable to be refreshed.
+ */
+#define REFRESH_VARIABLE_BOOL(name) \
+	mysql_thread___ ## name = (bool)GloMTH->get_variable_int((char *)STRINGIFY(name))
+
+/**
+ * @brief Refreshes an integer variable from the MySQL thread.
+ * 
+ * This macro updates the value of an integer variable named 'name' from
+ * the MySQL thread. It retrieves the value using the 'get_variable_int' function
+ * from the 'GloMTH' object and assigns it to the variable 'mysql_thread___name'.
+ * 
+ * @param name The name of the integer variable to be refreshed.
+ */
+#define REFRESH_VARIABLE_INT(name) \
+	mysql_thread___ ## name = GloMTH->get_variable_int((char *)STRINGIFY(name))
+
+/**
+ * @brief Refreshes a character variable from the MySQL thread.
+ * 
+ * This macro updates the value of a character variable named 'name' from
+ * the MySQL thread. It retrieves the value using the 'get_variable_string' function
+ * from the 'GloMTH' object and assigns it to the variable 'mysql_thread___name'.
+ * If the variable 'mysql_thread___name' was previously allocated memory,
+ * it frees that memory before assigning the new value.
+ * 
+ * @param name The name of the character variable to be refreshed.
+ */
+#define REFRESH_VARIABLE_CHAR(name) \
+	do { \
+		if (mysql_thread___ ## name) free(mysql_thread___ ## name); \
+		mysql_thread___ ## name =       GloMTH->get_variable_string((char *)STRINGIFY(name)); \
+	} while (0)
 
 extern Query_Processor *GloQPro;
 extern MySQL_Authentication *GloMyAuth;
@@ -97,50 +169,6 @@ mythr_g_st_vars_t MySQL_Thread_status_variables_gauge_array[] {
 
 extern mysql_variable_st mysql_tracked_variables[];
 
-const MARIADB_CHARSET_INFO * proxysql_find_charset_nr(unsigned int nr) {
-	const MARIADB_CHARSET_INFO * c = mariadb_compiled_charsets;
-	do {
-		if (c->nr == nr) {
-			return c;
-		}
-		++c;
-	} while (c[0].nr != 0);
-	return NULL;
-}
-
-MARIADB_CHARSET_INFO * proxysql_find_charset_name(const char *name) {
-	MARIADB_CHARSET_INFO *c = (MARIADB_CHARSET_INFO *)mariadb_compiled_charsets;
-	do {
-		if (!strcasecmp(c->csname, name)) {
-			return c;
-		}
-		++c;
-	} while (c[0].nr != 0);
-	return NULL;
-}
-
-MARIADB_CHARSET_INFO * proxysql_find_charset_collate_names(const char *csname, const char *collatename) {
-	MARIADB_CHARSET_INFO *c = (MARIADB_CHARSET_INFO *)mariadb_compiled_charsets;
-	do {
-		if (!strcasecmp(c->csname, csname) && !strcasecmp(c->name, collatename)) {
-			return c;
-		}
-		++c;
-	} while (c[0].nr != 0);
-	return NULL;
-}
-
-MARIADB_CHARSET_INFO * proxysql_find_charset_collate(const char *collatename) {
-	MARIADB_CHARSET_INFO *c = (MARIADB_CHARSET_INFO *)mariadb_compiled_charsets;
-	do {
-		if (!strcasecmp(c->name, collatename)) {
-			return c;
-		}
-		++c;
-	} while (c[0].nr != 0);
-	return NULL;
-}
-
 #ifdef __cplusplus
 extern "C" {
 #endif /* __cplusplus */
@@ -166,112 +194,6 @@ extern "C" {
 __thread unsigned int __thread_MySQL_Thread_Variables_version;
 
 volatile static unsigned int __global_MySQL_Thread_Variables_version;
-
-
-
-static unsigned int near_pow_2 (unsigned int n) {
-	unsigned int i = 1;
-	while (i < n) i <<= 1;
-	return i ? i : n;
-}
-
-
-void ProxySQL_Poll::shrink() {
-	unsigned int new_size=near_pow_2(len+1);
-	fds=(struct pollfd *)realloc(fds,new_size*sizeof(struct pollfd));
-	myds=(MySQL_Data_Stream **)realloc(myds,new_size*sizeof(MySQL_Data_Stream *));
-	last_recv=(unsigned long long *)realloc(last_recv,new_size*sizeof(unsigned long long));
-	last_sent=(unsigned long long *)realloc(last_sent,new_size*sizeof(unsigned long long));
-	size=new_size;
-}
-
-void ProxySQL_Poll::expand(unsigned int more) {
-	if ( (len+more) > size ) {
-		unsigned int new_size=near_pow_2(len+more);
-		fds=(struct pollfd *)realloc(fds,new_size*sizeof(struct pollfd));
-		myds=(MySQL_Data_Stream **)realloc(myds,new_size*sizeof(MySQL_Data_Stream *));
-		last_recv=(unsigned long long *)realloc(last_recv,new_size*sizeof(unsigned long long));
-		last_sent=(unsigned long long *)realloc(last_sent,new_size*sizeof(unsigned long long));
-		size=new_size;
-	}
-}
-
-ProxySQL_Poll::ProxySQL_Poll() {
-	loop_counters=new StatCounters(15,10);
-	poll_timeout=0;
-	loops=0;
-	len=0;
-	pending_listener_add=0;
-	pending_listener_del=0;
-	size=MIN_POLL_LEN;
-	fds=(struct pollfd *)malloc(size*sizeof(struct pollfd));
-	myds=(MySQL_Data_Stream **)malloc(size*sizeof(MySQL_Data_Stream *));
-	last_recv=(unsigned long long *)malloc(size*sizeof(unsigned long long));
-	last_sent=(unsigned long long *)malloc(size*sizeof(unsigned long long));
-}
-
-
-ProxySQL_Poll::~ProxySQL_Poll() {
-	unsigned int i;
-	for (i=0;i<len;i++) {
-		if (
-			myds[i] && // fix bug #278 . This should be caused by not initialized datastreams used to ping the backend
-			myds[i]->myds_type==MYDS_LISTENER) {
-				delete myds[i];
-		}
-	}
-	free(myds);
-	free(fds);
-	free(last_recv);
-	free(last_sent);
-	delete loop_counters;
-}
-
-
-void ProxySQL_Poll::add(uint32_t _events, int _fd, MySQL_Data_Stream *_myds, unsigned long long sent_time) {
-	if (len==size) {
-		expand(1);
-	}
-	myds[len]=_myds;
-	fds[len].fd=_fd;
-	fds[len].events=_events;
-	fds[len].revents=0;
-	if (_myds) {
-		_myds->mypolls=this;
-		_myds->poll_fds_idx=len;  // fix a serious bug
-	}
-	last_recv[len]=monotonic_time();
-	last_sent[len]=sent_time;
-	len++;
-}
-
-void ProxySQL_Poll::remove_index_fast(unsigned int i) {
-	if ((int)i==-1) return;
-	myds[i]->poll_fds_idx=-1; // this prevents further delete
-	if (i != (len-1)) {
-		myds[i]=myds[len-1];
-		fds[i].fd=fds[len-1].fd;
-		fds[i].events=fds[len-1].events;
-		fds[i].revents=fds[len-1].revents;
-		myds[i]->poll_fds_idx=i;  // fix a serious bug
-		last_recv[i]=last_recv[len-1];
-		last_sent[i]=last_sent[len-1];
-	}
-	len--;
-	if ( ( len>MIN_POLL_LEN ) && ( size > len*MIN_POLL_DELETE_RATIO ) ) {
-		shrink();
-	}
-}
-
-int ProxySQL_Poll::find_index(int fd) {
-	unsigned int i;
-	for (i=0; i<len; i++) {
-		if (fds[i].fd==fd) {
-			return i;
-		}
-	}
-	return -1;
-}
 
 
 MySQL_Listeners_Manager::MySQL_Listeners_Manager() {
@@ -449,9 +371,11 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"monitor_ping_interval",
 	(char *)"monitor_ping_max_failures",
 	(char *)"monitor_ping_timeout",
+	(char *)"monitor_aws_rds_topology_discovery_interval",
 	(char *)"monitor_read_only_interval",
 	(char *)"monitor_read_only_timeout",
 	(char *)"monitor_read_only_max_timeout_count",
+	(char *)"monitor_replication_lag_group_by_host",
 	(char *)"monitor_replication_lag_interval",
 	(char *)"monitor_replication_lag_timeout",
 	(char *)"monitor_replication_lag_count",
@@ -472,6 +396,9 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"monitor_threads_min",
 	(char *)"monitor_threads_max",
 	(char *)"monitor_threads_queue_maxsize",
+	(char *)"monitor_local_dns_cache_ttl",
+	(char *)"monitor_local_dns_cache_refresh_interval",
+	(char *)"monitor_local_dns_resolver_queue_maxsize",
 	(char *)"monitor_wait_timeout",
 	(char *)"monitor_writer_is_also_reader",
 	(char *)"max_allowed_packet",
@@ -497,6 +424,7 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"query_digests_max_query_length",
 	(char *)"query_digests_grouping_limit",
 	(char *)"query_digests_groups_grouping_limit",
+	(char *)"query_rules_fast_routing_algorithm",
 	(char *)"wait_timeout",
 	(char *)"throttle_max_bytes_per_second_to_client",
 	(char *)"throttle_ratio_server_to_client",
@@ -511,10 +439,14 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"query_processor_iterations",
 	(char *)"query_processor_regex",
 	(char *)"set_query_lock_on_hostgroup",
+	(char *)"set_parser_algorithm",
 	(char *)"reset_connection_algorithm",
 	(char *)"auto_increment_delay_multiplex",
+	(char *)"auto_increment_delay_multiplex_timeout_ms",
 	(char *)"long_query_time",
 	(char *)"query_cache_size_MB",
+	(char *)"query_cache_soft_ttl_pct",
+	(char *)"query_cache_handle_warnings",
 	(char *)"ping_interval_server_msec",
 	(char *)"ping_timeout_server",
 	(char *)"default_schema",
@@ -523,6 +455,7 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"server_capabilities",
 	(char *)"server_version",
 	(char *)"keep_multiplexing_variables",
+	(char *)"default_authentication_plugin",
 	(char *)"kill_backend_connection_when_disconnect",
 	(char *)"client_session_track_gtid",
 	(char *)"sessions_sort",
@@ -538,6 +471,7 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"query_digests_normalize_digest_text",
 	(char *)"query_digests_track_hostname",
 	(char *)"query_digests_keep_comment",
+	(char *)"parse_failure_logs_digest",
 	(char *)"servers_stats",
 	(char *)"default_reconnect",
 #ifdef DEBUG
@@ -555,7 +489,6 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"init_connect",
 	(char *)"ldap_user_variable",
 	(char *)"add_ldap_user_comment",
-	(char *)"default_tx_isolation",
 	(char *)"default_session_track_gtids",
 	(char *)"connpoll_reset_queue_length",
 	(char *)"min_num_servers_lantency_awareness",
@@ -563,6 +496,9 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"stats_time_backend_query",
 	(char *)"stats_time_query_processor",
 	(char *)"query_cache_stores_empty_result",
+	(char *)"data_packets_history_size",
+	(char *)"handle_warnings",
+	(char *)"evaluate_replication_lag_on_servers_load",
 	NULL
 };
 
@@ -634,25 +570,6 @@ th_metrics_map = std::make_tuple(
 			"Total number of bytes (sent|received) in frontend connections.",
 			metric_tags {
 				{ "traffic_flow", "received" }
-			}
-		),
-		// ====================================================================
-
-		// ====================================================================
-		std::make_tuple (
-			p_th_counter::client_connections_created,
-			"proxysql_client_connections_total",
-			"Total number of client connections created or failed (including improperly closed).",
-			metric_tags {
-				{ "status", "created" }
-			}
-		),
-		std::make_tuple (
-			p_th_counter::client_connections_aborted,
-			"proxysql_client_connections_total",
-			"Total number of client connections created or failed (including improperly closed).",
-			metric_tags {
-				{ "status", "aborted" }
 			}
 		),
 		// ====================================================================
@@ -972,6 +889,12 @@ th_metrics_map = std::make_tuple(
 			metric_tags {}
 		),
 		std::make_tuple (
+			p_th_gauge::mysql_monitor_aws_rds_topology_discovery_interval,
+			"proxysql_mysql_monitor_aws_rds_topology_discovery_interval",
+			"How frequently a topology discovery is performed, e.g. a value of 500 means one topology discovery every 500 read-only checks ",
+			metric_tags {}
+		),
+		std::make_tuple (
 			p_th_gauge::mysql_monitor_read_only_interval,
 			"proxysql_mysql_monitor_read_only_interval_seconds",
 			"How frequently a read only check is performed, in seconds.",
@@ -987,6 +910,12 @@ th_metrics_map = std::make_tuple(
 			p_th_gauge::mysql_monitor_writer_is_also_reader,
 			"proxysql_mysql_monitor_writer_is_also_reader",
 			"Encodes different behaviors for nodes depending on their 'READ_ONLY' flag value.",
+			metric_tags {}
+		),
+		std::make_tuple (
+			p_th_gauge::mysql_monitor_replication_lag_group_by_host,
+			"proxysql_monitor_replication_lag_group_by_host",
+			"Encodes different replication lag check if the same server is in multiple hostgroups.",
 			metric_tags {}
 		),
 		std::make_tuple (
@@ -1039,6 +968,8 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.query_retries_on_failure=1;
 	variables.client_host_cache_size=0;
 	variables.client_host_error_counts=0;
+	variables.handle_warnings=1;
+	variables.evaluate_replication_lag_on_servers_load=1;
 	variables.connect_retries_on_failure=10;
 	variables.connection_delay_multiplex_ms=0;
 	variables.connection_max_age_ms=0;
@@ -1048,15 +979,17 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.free_connections_pct=10;
 	variables.connect_retries_delay=1;
 	variables.monitor_enabled=true;
-	variables.monitor_history=600000;
+	variables.monitor_history=7200000; // changed in 2.6.0 : was 600000
 	variables.monitor_connect_interval=120000;
 	variables.monitor_connect_timeout=600;
 	variables.monitor_ping_interval=8000;
 	variables.monitor_ping_max_failures=3;
 	variables.monitor_ping_timeout=1000;
+	variables.monitor_aws_rds_topology_discovery_interval=0;
 	variables.monitor_read_only_interval=1000;
 	variables.monitor_read_only_timeout=800;
 	variables.monitor_read_only_max_timeout_count=3;
+	variables.monitor_replication_lag_group_by_host=false;
 	variables.monitor_replication_lag_interval=10000;
 	variables.monitor_replication_lag_timeout=1000;
 	variables.monitor_replication_lag_count=1;
@@ -1074,6 +1007,9 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.monitor_threads_min = 8;
 	variables.monitor_threads_max = 128;
 	variables.monitor_threads_queue_maxsize = 128;
+	variables.monitor_local_dns_cache_ttl = 300000;
+	variables.monitor_local_dns_cache_refresh_interval = 60000;
+	variables.monitor_local_dns_resolver_queue_maxsize = 128;
 	variables.monitor_username=strdup((char *)"monitor");
 	variables.monitor_password=strdup((char *)"monitor");
 	variables.monitor_replication_lag_use_percona_heartbeat=strdup((char *)"");
@@ -1083,8 +1019,8 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.automatic_detect_sqli=false;
 	variables.firewall_whitelist_enabled=false;
 	variables.firewall_whitelist_errormsg = strdup((char *)"Firewall blocked this query");
-	variables.use_tcp_keepalive=false;
-	variables.tcp_keepalive_time=0;
+	variables.use_tcp_keepalive=true; // changed in 2.6.0 , was false
+	variables.tcp_keepalive_time=120; // changed in 2.6.0 , was 0
 	variables.throttle_connections_per_sec_to_hostgroup=1000000;
 	variables.max_transaction_idle_time=4*3600*1000;
 	variables.max_transaction_time=4*3600*1000;
@@ -1094,6 +1030,7 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.threshold_resultset_size=4*1024*1024;
 	variables.query_digests_max_digest_length=2*1024;
 	variables.query_digests_max_query_length=65000; // legacy default
+	variables.query_rules_fast_routing_algorithm=1;
 	variables.wait_timeout=8*3600*1000;
 	variables.throttle_max_bytes_per_second_to_client=0;
 	variables.throttle_ratio_server_to_client=0;
@@ -1109,24 +1046,27 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.query_processor_iterations=0;
 	variables.query_processor_regex=1;
 	variables.set_query_lock_on_hostgroup=1;
+	variables.set_parser_algorithm=2; // before 2.6.0 this was 1
 	variables.reset_connection_algorithm=2;
 	variables.auto_increment_delay_multiplex=5;
+	variables.auto_increment_delay_multiplex_timeout_ms=10000;
 	variables.long_query_time=1000;
 	variables.query_cache_size_MB=256;
+	variables.query_cache_soft_ttl_pct=0;
+	variables.query_cache_handle_warnings=0;
 	variables.init_connect=NULL;
 	variables.ldap_user_variable=NULL;
 	variables.add_ldap_user_comment=NULL;
 	for (int i=0; i<SQL_NAME_LAST_LOW_WM; i++) {
 		variables.default_variables[i]=strdup(mysql_tracked_variables[i].default_value);
 	}
-	variables.default_tx_isolation=strdup((char *)MYSQL_DEFAULT_TX_ISOLATION);
 	variables.default_session_track_gtids=strdup((char *)MYSQL_DEFAULT_SESSION_TRACK_GTIDS);
 	variables.ping_interval_server_msec=10000;
 	variables.ping_timeout_server=200;
 	variables.default_schema=strdup((char *)"information_schema");
 	variables.handle_unknown_charset=1;
 	variables.interfaces=strdup((char *)"");
-	variables.server_version=strdup((char *)"5.5.30");
+	variables.server_version=strdup((char *)"8.0.11"); // changed in 2.6.0 , was 5.5.30
 	variables.eventslog_filename=strdup((char *)""); // proxysql-mysql-eventslog is recommended
 	variables.eventslog_filesize=100*1024*1024;
 	variables.eventslog_default_log=0;
@@ -1139,7 +1079,7 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.poll_timeout=2000;
 	variables.poll_timeout_on_failure=100;
 	variables.have_compress=true;
-	variables.have_ssl = false; // disable by default for performance reason
+	variables.have_ssl = true; // changed in 2.6.0 , was false by default for performance reason
 	variables.commands_stats=true;
 	variables.multiplexing=true;
 	variables.log_unhealthy_connections=true;
@@ -1154,6 +1094,7 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.query_digests_normalize_digest_text=false;
 	variables.query_digests_track_hostname=false;
 	variables.query_digests_keep_comment=false;
+	variables.parse_failure_logs_digest=false;
 	variables.connpoll_reset_queue_length = 50;
 	variables.min_num_servers_lantency_awareness = 1000;
 	variables.aurora_max_lag_ms_only_read_from_replicas = 2;
@@ -1178,15 +1119,18 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.ssl_p2s_crl=NULL;
 	variables.ssl_p2s_crlpath=NULL;
 	variables.keep_multiplexing_variables=strdup((char *)"tx_isolation,transaction_isolation,version");
+	variables.default_authentication_plugin=strdup((char *)"mysql_native_password");
+	variables.default_authentication_plugin_int = 0; // mysql_native_password
 #ifdef DEBUG
 	variables.session_debug=true;
 #endif /*debug */
 	variables.query_digests_grouping_limit = 3;
-	variables.query_digests_groups_grouping_limit= 0;
+	variables.query_digests_groups_grouping_limit= 10; // changed in 2.6.0 , was 0
 	variables.enable_client_deprecate_eof=true;
 	variables.enable_server_deprecate_eof=true;
 	variables.enable_load_data_local_infile=false;
 	variables.log_mysql_warnings_enabled=false;
+	variables.data_packets_history_size=0;
 	// status variables
 	status_variables.mirror_sessions_current=0;
 	__global_MySQL_Thread_Variables_version=1;
@@ -1281,6 +1225,19 @@ void MySQL_Threads_Handler::commit() {
 	proxy_debug(PROXY_DEBUG_MYSQL_SERVER, 1, "Increasing version number to %d - all threads will notice this and refresh their variables\n", __global_MySQL_Thread_Variables_version);
 }
 
+
+/**
+ * Retrieves the string value of a specified global variable.
+ *
+ * This method searches for a global variable by name and returns its current
+ * string value. It's used to access configuration settings that are stored
+ * as strings within the MySQL Threads Handler. If the variable is not found,
+ * or if it is not a string type, a default or NULL value may be returned.
+ *
+ * @param name The name of the variable to retrieve.
+ * @return A pointer to the string value of the variable, or NULL if the
+ * variable does not exist or is not of string type.
+ */
 char * MySQL_Threads_Handler::get_variable_string(char *name) {
 	if (!strncmp(name,"monitor_",8)) {
 		if (!strcmp(name,"monitor_username")) return strdup(variables.monitor_username);
@@ -1379,12 +1336,6 @@ char * MySQL_Threads_Handler::get_variable_string(char *name) {
 				return strdup(variables.default_variables[i]);
 			}
 		}
-		if (!strcmp(name,"default_tx_isolation")) {
-			if (variables.default_tx_isolation==NULL) {
-				variables.default_tx_isolation=strdup((char *)MYSQL_DEFAULT_TX_ISOLATION);
-			}
-			return strdup(variables.default_tx_isolation);
-		}
 		if (!strcmp(name,"default_session_track_gtids")) {
 			if (variables.default_session_track_gtids==NULL) {
 				variables.default_session_track_gtids=strdup((char *)MYSQL_DEFAULT_SESSION_TRACK_GTIDS);
@@ -1398,6 +1349,7 @@ char * MySQL_Threads_Handler::get_variable_string(char *name) {
 	if (!strcmp(name,"auditlog_filename")) return strdup(variables.auditlog_filename);
 	if (!strcmp(name,"interfaces")) return strdup(variables.interfaces);
 	if (!strcmp(name,"keep_multiplexing_variables")) return strdup(variables.keep_multiplexing_variables);
+	if (!strcmp(name,"default_authentication_plugin")) return strdup(variables.default_authentication_plugin);
 	// LCOV_EXCL_START
 	proxy_error("Not existing variable: %s\n", name); assert(0);
 	return NULL;
@@ -1412,6 +1364,21 @@ uint16_t MySQL_Threads_Handler::get_variable_uint16(char *name) {
 	// LCOV_EXCL_STOP
 }
 
+
+/**
+ * Retrieves the integer value of a specified global variable.
+ *
+ * This method is responsible for fetching the value of a global configuration
+ * variable that is stored as an integer. It looks up the variable by its name
+ * and returns the integer value associated with it. This is useful for obtaining
+ * configuration settings that are expected to be numerical values. If the variable
+ * cannot be found or is not an integer type, a default value may be returned,
+ * typically indicating an error or not set state.
+ *
+ * @param name The name of the variable to retrieve.
+ * @return The integer value of the variable if found and valid, otherwise a
+ * default or error-indicating value.
+ */
 int MySQL_Threads_Handler::get_variable_int(const char *name) {
 	// convert name to string, and lowercase
 	std::string nameS = string(name);
@@ -1444,6 +1411,17 @@ int MySQL_Threads_Handler::get_variable_int(const char *name) {
 //VALGRIND_ENABLE_ERROR_REPORTING;
 }
 
+/**
+ * Retrieves the value of a specified configuration variable.
+ *
+ * This method looks up a global configuration variable by its name and returns its value as a char pointer.
+ * It's designed to access various types of configuration settings within the MySQL Threads Handler context.
+ * The function can return values for variables of different types, but the caller must ensure proper type handling.
+ * If the variable is not found, a NULL pointer is returned.
+ *
+ * @param name The name of the variable to retrieve.
+ * @return The value of the variable as a char pointer, or NULL if the variable does not exist.
+ */
 char * MySQL_Threads_Handler::get_variable(char *name) {	// this is the public function, accessible from admin
 //VALGRIND_DISABLE_ERROR_REPORTING;
 #define INTBUFSIZE	4096
@@ -1500,12 +1478,6 @@ char * MySQL_Threads_Handler::get_variable(char *name) {	// this is the public f
 			return strdup(variables.add_ldap_user_comment);
 		}
 	}
-	if (!strcasecmp(name,"default_tx_isolation")) {
-		if (variables.default_tx_isolation==NULL) {
-			variables.default_tx_isolation=strdup((char *)MYSQL_DEFAULT_TX_ISOLATION);
-		}
-		return strdup(variables.default_tx_isolation);
-	}
 	if (!strcasecmp(name,"default_session_track_gtids")) {
 		if (variables.default_session_track_gtids==NULL) {
 			variables.default_session_track_gtids=strdup((char *)MYSQL_DEFAULT_SESSION_TRACK_GTIDS);
@@ -1532,6 +1504,7 @@ char * MySQL_Threads_Handler::get_variable(char *name) {	// this is the public f
 	if (!strcasecmp(name,"eventslog_filename")) return strdup(variables.eventslog_filename);
 	if (!strcasecmp(name,"default_schema")) return strdup(variables.default_schema);
 	if (!strcasecmp(name,"keep_multiplexing_variables")) return strdup(variables.keep_multiplexing_variables);
+	if (!strcasecmp(name,"default_authentication_plugin")) return strdup(variables.default_authentication_plugin);
 	if (!strcasecmp(name,"interfaces")) return strdup(variables.interfaces);
 	if (!strcasecmp(name,"server_capabilities")) {
 		// FIXME : make it human readable
@@ -1610,19 +1583,22 @@ char * MySQL_Threads_Handler::get_variable(char *name) {	// this is the public f
 }
 
 
-
+/**
+ * Sets the value of a specified global variable.
+ *
+ * This method allows for the modification of global variables within the MySQL Threads Handler
+ * by specifying the variable's name and the desired new value. It supports changing the values
+ * of variables across various types, though the input is accepted as a string. Proper conversion
+ * to the variable's actual type is performed internally. This function is key for dynamic configuration
+ * updates and runtime adjustments of the proxy's behavior.
+ *
+ * @param name The name of the variable to set.
+ * @param value The new value for the variable, passed as a const char pointer.
+ * @return True if the variable was successfully updated, false otherwise.
+ */
 bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// this is the public function, accessible from admin
-	// IN:
-	// name: variable name
-	// value: variable value
-	//
-	// OUT:
-	// false: unable to change the variable value, either because doesn't exist, or because out of range, or read only
-	// true: variable value changed
-	//
 	if (!value) return false;
 	size_t vallen=strlen(value);
-
 
 	// convert name to string, and lowercase
 	std::string nameS = string(name);
@@ -1631,6 +1607,23 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 		// integer variable ?
 		std::unordered_map<std::string, std::tuple<int *, int, int, bool>>::const_iterator it = VariablesPointers_int.find(nameS);
 		if (it != VariablesPointers_int.end()) {
+			// Log warnings for variables with possibly wrong values
+			if (nameS == "auto_increment_delay_multiplex_timeout_ms") {
+				int intv = atoi(value);
+				if (intv <= 60) {
+					proxy_warning("'mysql-auto_increment_delay_multiplex_timeout_ms' is set to a low value: %ums. Remember value is in 'ms'\n", intv);
+				}
+			}
+			if (nameS == "query_rules_fast_routing_algorithm") {
+				if (GloQPro) {
+					int intv = atoi(value);
+					if (intv >= std::get<1>(it->second) && intv <= std::get<2>(it->second)) {
+						GloQPro->wrlock();
+						GloQPro->query_rules_fast_routing_algorithm = intv;
+						GloQPro->wrunlock();
+					}
+				}
+			}
 			bool special_variable = std::get<3>(it->second); // if special_variable is true, min and max values are ignored, and more input validation is needed
 			if (special_variable == false) {
 				int intv=atoi(value);
@@ -1818,19 +1811,6 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 		return true;
 	}
 
-	if (!strcasecmp(name,"default_tx_isolation")) {
-		if (variables.default_tx_isolation) free(variables.default_tx_isolation);
-		variables.default_tx_isolation=NULL;
-		if (vallen) {
-			if (strcmp(value,"(null)"))
-				variables.default_tx_isolation=strdup(value);
-		}
-		if (variables.default_tx_isolation==NULL) {
-			variables.default_tx_isolation=strdup((char *)MYSQL_DEFAULT_TX_ISOLATION); // default
-		}
-		return true;
-	}
-
 	if (!strcasecmp(name,"default_session_track_gtids")) {
 		if (variables.default_session_track_gtids) free(variables.default_session_track_gtids);
 		variables.default_session_track_gtids=NULL;
@@ -1865,6 +1845,25 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 				if (variables.default_variables[i] == NULL)
 					variables.default_variables[i] = strdup(mysql_tracked_variables[i].default_value);
 				return true;
+			}
+		}
+		if (!strcasecmp(name,"default_authentication_plugin")) {
+			if (vallen) {
+				const char * valids[2] = { "mysql_native_password", "caching_sha2_password" };
+				for (long unsigned int i=0; i < sizeof(valids)/sizeof(char *) ; i++) {
+					if (strcmp(valids[i],value)==0) {
+						free(variables.default_authentication_plugin);
+						variables.default_authentication_plugin=strdup(value);
+						if (i==0) variables.default_authentication_plugin_int = 0;
+						if (i==1) variables.default_authentication_plugin_int = 2;
+						return true;
+					}
+				}
+				// not found
+				proxy_error("%s is an invalid value for default_authentication_plugin\n", value);
+				return false;
+			} else {
+				return false;
 			}
 		}
 	}
@@ -1950,16 +1949,18 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 			return false;
 		} else if (value[0] == '/') {
 			char *full_path = strdup(value);
-                        char *eval_dirname = dirname(full_path);
-                        DIR* eventlog_dir = opendir(eval_dirname);
-			free(full_path);
-                        if (eventlog_dir) {
+			char* eval_dirname = dirname(full_path);
+			DIR* eventlog_dir = opendir(eval_dirname);
+			if (eventlog_dir) {
 				closedir(eventlog_dir);
 				free(variables.auditlog_filename);
-				variables.auditlog_filename=strdup(value);
-                                return true;
-			} else {
+				variables.auditlog_filename = strdup(value);
+				free(full_path);
+				return true;
+			}
+			else {
 				proxy_error("%s is an invalid value for auditlog_filename path, the directory cannot be accessed\n", eval_dirname);
+				free(full_path);
 				return false;
 			}
 		} else {
@@ -1974,16 +1975,18 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 			return false;
 		} else if (value[0] == '/') {
 			char *full_path = strdup(value);
-                        char *eval_dirname = dirname(full_path);
-                        DIR* eventlog_dir = opendir(eval_dirname);
-			free(full_path);
-                        if (eventlog_dir) {
+			char* eval_dirname = dirname(full_path);
+			DIR* eventlog_dir = opendir(eval_dirname);
+			if (eventlog_dir) {
 				closedir(eventlog_dir);
 				free(variables.eventslog_filename);
-				variables.eventslog_filename=strdup(value);
-                                return true;
-			} else {
+				variables.eventslog_filename = strdup(value);
+				free(full_path);
+				return true;
+			}
+			else {
 				proxy_error("%s is an invalid value for eventslog_filename path, the directory cannot be accessed\n", eval_dirname);
+				free(full_path);
 				return false;
 			}
 		} else {
@@ -1993,8 +1996,12 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 		}
 	}
 	if (!strcasecmp(name,"server_capabilities")) {
-		int intv=atoi(value);
-		if (intv > 10 && intv <= 65535) {
+		// replaced atoi() with strtoul() to have a 32 bit result
+		uint32_t intv = strtoul(value, NULL, 10);
+		if (intv > 10) {
+			// Note that:
+			// - some capabilities are changed at runtime while performing the handshake with the client
+			// - even if we support 32 bits capabilities, many of them do not have any real meaning for proxysql (not supported)
 			variables.server_capabilities=intv;
 			return true;
 		} else {
@@ -2053,11 +2060,32 @@ bool MySQL_Threads_Handler::set_variable(char *name, const char *value) {	// thi
 		}
 		return false;
 	}
+	if (!strcasecmp(name,"data_packets_history_size")) {
+		int intv=atoi(value);
+		if (intv >= 0 && intv < INT_MAX) {
+			variables.data_packets_history_size = intv;
+			GloVars.global.data_packets_history_size = intv;
+			return true;
+		} else {
+			return false;
+		}
+	}
 	return false;
 }
 
 
-// return variables from both mysql_thread_variables_names AND mysql_tracked_variables
+/**
+ * Retrieves a list of all global configuration variables' names.
+ *
+ * This method returns an array of strings, each representing the name of a global configuration
+ * variable managed by the MySQL Threads Handler. It's utilized to enumerate all available configuration
+ * settings, facilitating dynamic inspection or modification of the proxy's configuration. The list
+ * includes variables of all types and categories, providing a comprehensive overview of the proxy's
+ * configurable parameters.
+ *
+ * @return A null-terminated array of char pointers, where each entry is the name of a global variable.
+ * The last element of the array is NULL to indicate the end of the list.
+ */
 char ** MySQL_Threads_Handler::get_variables_list() {
 
 
@@ -2080,6 +2108,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_bool["log_mysql_warnings_enabled"]      = make_tuple(&variables.log_mysql_warnings_enabled,      false);
 		VariablesPointers_bool["log_unhealthy_connections"]       = make_tuple(&variables.log_unhealthy_connections,       false);
 		VariablesPointers_bool["monitor_enabled"]                 = make_tuple(&variables.monitor_enabled,                 false);
+		VariablesPointers_bool["monitor_replication_lag_group_by_host"] = make_tuple(&variables.monitor_replication_lag_group_by_host, false);
 		VariablesPointers_bool["monitor_wait_timeout"]            = make_tuple(&variables.monitor_wait_timeout,            false);
 		VariablesPointers_bool["monitor_writer_is_also_reader"]   = make_tuple(&variables.monitor_writer_is_also_reader,   false);
 		VariablesPointers_bool["multiplexing"]                    = make_tuple(&variables.multiplexing,                    false);
@@ -2091,6 +2120,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_bool["query_digests_normalize_digest_text"] = make_tuple(&variables.query_digests_normalize_digest_text, false);
 		VariablesPointers_bool["query_digests_track_hostname"]    = make_tuple(&variables.query_digests_track_hostname,    false);
 		VariablesPointers_bool["query_digests_keep_comment"]      = make_tuple(&variables.query_digests_keep_comment,      false);
+		VariablesPointers_bool["parse_failure_logs_digest"]       = make_tuple(&variables.parse_failure_logs_digest,       false);
 		VariablesPointers_bool["servers_stats"]                   = make_tuple(&variables.servers_stats,                   false);
 		VariablesPointers_bool["sessions_sort"]                   = make_tuple(&variables.sessions_sort,                   false);
 		VariablesPointers_bool["stats_time_backend_query"]        = make_tuple(&variables.stats_time_backend_query,        false);
@@ -2123,6 +2153,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["monitor_ping_timeout"]      = make_tuple(&variables.monitor_ping_timeout,      100,       600*1000, false);
 		VariablesPointers_int["monitor_ping_max_failures"] = make_tuple(&variables.monitor_ping_max_failures,   1,      1000*1000, false);
 
+		VariablesPointers_int["monitor_aws_rds_topology_discovery_interval"] = make_tuple(&variables.monitor_aws_rds_topology_discovery_interval, 0, 100000, false);
 		VariablesPointers_int["monitor_read_only_interval"]          = make_tuple(&variables.monitor_read_only_interval,        100, 7*24*3600*1000, false);
 		VariablesPointers_int["monitor_read_only_timeout"]           = make_tuple(&variables.monitor_read_only_timeout,         100,       600*1000, false);
 		VariablesPointers_int["monitor_read_only_max_timeout_count"] = make_tuple(&variables.monitor_read_only_max_timeout_count, 1,      1000*1000, false);
@@ -2144,27 +2175,33 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["monitor_query_interval"] = make_tuple(&variables.monitor_query_interval,  100, 7*24*3600*1000, false);
 		VariablesPointers_int["monitor_query_timeout"]  = make_tuple(&variables.monitor_query_timeout,   100,       600*1000, false);
 
-		VariablesPointers_int["monitor_threads_min"]    = make_tuple(&variables.monitor_threads_min, 2,  16, false);
-		VariablesPointers_int["monitor_threads_max"]    = make_tuple(&variables.monitor_threads_max, 4, 256, false);
+		VariablesPointers_int["monitor_threads_min"]    = make_tuple(&variables.monitor_threads_min, 2,  256, false);
+		VariablesPointers_int["monitor_threads_max"]    = make_tuple(&variables.monitor_threads_max, 4, 1024, false);
 
 		VariablesPointers_int["monitor_slave_lag_when_null"]   = make_tuple(&variables.monitor_slave_lag_when_null,    0, 604800, false);
 		VariablesPointers_int["monitor_threads_queue_maxsize"] = make_tuple(&variables.monitor_threads_queue_maxsize, 16,   1024, false);
 
+		VariablesPointers_int["monitor_local_dns_cache_ttl"] = make_tuple(&variables.monitor_local_dns_cache_ttl, 0, 7*24*3600*1000, false);
+		VariablesPointers_int["monitor_local_dns_cache_refresh_interval"] = make_tuple(&variables.monitor_local_dns_cache_refresh_interval, 0, 7*24*3600*1000, false);
+		VariablesPointers_int["monitor_local_dns_resolver_queue_maxsize"] = make_tuple(&variables.monitor_local_dns_resolver_queue_maxsize, 16, 1024, false);
 		// mirroring
 		VariablesPointers_int["mirror_max_concurrency"]  = make_tuple(&variables.mirror_max_concurrency, 1,     8*1024, false);
 		VariablesPointers_int["mirror_max_queue_length"] = make_tuple(&variables.mirror_max_queue_length, 0, 1024*1024, false);
 		// query processor and query digest
 		VariablesPointers_int["auto_increment_delay_multiplex"]  = make_tuple(&variables.auto_increment_delay_multiplex,   0,     1000000, false);
+		VariablesPointers_int["auto_increment_delay_multiplex_timeout_ms"]  = make_tuple(&variables.auto_increment_delay_multiplex_timeout_ms,   0, 3600*1000, false);
 		VariablesPointers_int["default_query_delay"]             = make_tuple(&variables.default_query_delay,              0,   3600*1000, false);
 		VariablesPointers_int["default_query_timeout"]           = make_tuple(&variables.default_query_timeout,         1000,20*24*3600*1000, false);
 		VariablesPointers_int["query_digests_grouping_limit"]    = make_tuple(&variables.query_digests_grouping_limit,     1,        2089, false);
 		VariablesPointers_int["query_digests_groups_grouping_limit"] = make_tuple(&variables.query_digests_groups_grouping_limit, 0, 2089, false);
 		VariablesPointers_int["query_digests_max_digest_length"] = make_tuple(&variables.query_digests_max_digest_length, 16, 1*1024*1024, false);
 		VariablesPointers_int["query_digests_max_query_length"]  = make_tuple(&variables.query_digests_max_query_length,  16, 1*1024*1024, false);
+		VariablesPointers_int["query_rules_fast_routing_algorithm"]  = make_tuple(&variables.query_rules_fast_routing_algorithm,  1, 2, false);
 		VariablesPointers_int["query_processor_iterations"]      = make_tuple(&variables.query_processor_iterations,       0,   1000*1000, false);
 		VariablesPointers_int["query_processor_regex"]           = make_tuple(&variables.query_processor_regex,            1,           2, false);
 		VariablesPointers_int["query_retries_on_failure"]        = make_tuple(&variables.query_retries_on_failure,         0,        1000, false);
 		VariablesPointers_int["set_query_lock_on_hostgroup"]     = make_tuple(&variables.set_query_lock_on_hostgroup,      0,           1, false);
+		VariablesPointers_int["set_parser_algorithm"]            = make_tuple(&variables.set_parser_algorithm,             1,           2, false);
 
 		// throttle
 		VariablesPointers_int["throttle_connections_per_sec_to_hostgroup"] = make_tuple(&variables.throttle_connections_per_sec_to_hostgroup, 1, 100*1000*1000, false);
@@ -2197,6 +2234,8 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["ping_timeout_server"]           = make_tuple(&variables.ping_timeout_server,          10,       600*1000, false);
 		VariablesPointers_int["client_host_cache_size"]        = make_tuple(&variables.client_host_cache_size,        0,      1024*1024, false);
 		VariablesPointers_int["client_host_error_counts"]      = make_tuple(&variables.client_host_error_counts,      0,      1024*1024, false);
+		VariablesPointers_int["handle_warnings"]			   = make_tuple(&variables.handle_warnings,				  0,			  1, false);
+		VariablesPointers_int["evaluate_replication_lag_on_servers_load"] = make_tuple(&variables.evaluate_replication_lag_on_servers_load, 0, 1, false);
 
 		// logs
 		VariablesPointers_int["auditlog_filesize"]     = make_tuple(&variables.auditlog_filesize,    1024*1024, 1*1024*1024*1024, false);
@@ -2207,10 +2246,13 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["max_allowed_packet"]        = make_tuple(&variables.max_allowed_packet,        8192,   1024*1024*1024, false);
 		VariablesPointers_int["max_connections"]           = make_tuple(&variables.max_connections,              1,        1000*1000, false);
 		VariablesPointers_int["max_stmts_per_connection"]  = make_tuple(&variables.max_stmts_per_connection,     1,             1024, false);
-		VariablesPointers_int["max_stmts_cache"]           = make_tuple(&variables.max_stmts_cache,           1024,        1024*1024, false);
+		VariablesPointers_int["max_stmts_cache"]           = make_tuple(&variables.max_stmts_cache,            128,        1024*1024, false);
 		VariablesPointers_int["max_transaction_idle_time"] = make_tuple(&variables.max_transaction_idle_time, 1000,  20*24*3600*1000, false);
 		VariablesPointers_int["max_transaction_time"]      = make_tuple(&variables.max_transaction_time,      1000,  20*24*3600*1000, false);
 		VariablesPointers_int["query_cache_size_mb"]       = make_tuple(&variables.query_cache_size_MB,          0,       1024*10240, false);
+		VariablesPointers_int["query_cache_soft_ttl_pct"]  = make_tuple(&variables.query_cache_soft_ttl_pct,     0,              100, false);
+		VariablesPointers_int["query_cache_handle_warnings"] = make_tuple(&variables.query_cache_handle_warnings,	 0,				   1, false);
+
 #ifdef IDLE_THREADS
 		VariablesPointers_int["session_idle_ms"]           = make_tuple(&variables.session_idle_ms,              1,        3600*1000, false);
 #endif // IDLE_THREADS
@@ -2223,7 +2265,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["binlog_reader_connect_retry_msec"] = make_tuple(&variables.binlog_reader_connect_retry_msec, 0, 0, true);
 		VariablesPointers_int["eventslog_format"] = make_tuple(&variables.eventslog_format, 0, 0, true);
 		VariablesPointers_int["wait_timeout"]     = make_tuple(&variables.wait_timeout,     0, 0, true);
-
+		VariablesPointers_int["data_packets_history_size"] = make_tuple(&variables.data_packets_history_size, 0, 0, true);
 
 	}
 
@@ -2254,8 +2296,17 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 	return ret;
 }
 
-// Returns true if the given name is the name of an existing mysql variable
-// scan both mysql_thread_variables_names AND mysql_tracked_variables
+/**
+ * @brief Checks whether the MySQL Threads Handler has a specific variable.
+ * 
+ * This function checks if the MySQL Threads Handler contains a variable with the given name.
+ * It first checks if the name starts with "default_" and matches the internal variable names 
+ * stored in the MySQL tracked variables. If not found, it then checks against the list of 
+ * thread variables.
+ * 
+ * @param name The name of the variable to check.
+ * @return true if the variable is found, false otherwise.
+ */
 bool MySQL_Threads_Handler::has_variable(const char *name) {
 	if (strlen(name) > 8) {
 		if (strncmp(name, "default_", 8) == 0) {
@@ -2285,6 +2336,18 @@ void MySQL_Threads_Handler::print_version() {
 	fprintf(stderr,"Standard MySQL Threads Handler rev. %s -- %s -- %s\n", MYSQL_THREAD_VERSION, __FILE__, __TIMESTAMP__);
 }
 
+/**
+ * @brief Initializes the MySQL Threads Handler with the given number of threads and stack size.
+ * 
+ * This function initializes the MySQL Threads Handler with the specified number of threads and 
+ * stack size. If the stack size is not provided (or is 0), it defaults to DEFAULT_STACK_SIZE. 
+ * If the number of threads is not provided (or is 0), it defaults to DEFAULT_NUM_THREADS. 
+ * After initialization, it sets the stack size using pthread_attr_setstacksize, allocates memory 
+ * for the MySQL threads, and initializes status variables accordingly.
+ * 
+ * @param num The number of threads to initialize. If 0, defaults to DEFAULT_NUM_THREADS.
+ * @param stack The size of the stack for each thread. If 0, defaults to DEFAULT_STACK_SIZE.
+ */
 void MySQL_Threads_Handler::init(unsigned int num, size_t stack) {
 	if (stack) {
 		stacksize=stack;
@@ -2309,6 +2372,19 @@ void MySQL_Threads_Handler::init(unsigned int num, size_t stack) {
 #endif // IDLE_THREADS
 }
 
+/**
+ * @brief Creates a new MySQL thread and starts its execution.
+ * 
+ * This function creates a new MySQL thread with the specified thread number, start routine, 
+ * and whether it's an idle thread or not. If idles is set to false, a regular MySQL thread 
+ * is created using pthread_create. If idles is true and idle_threads are enabled, an idle 
+ * MySQL thread is created. After creating the thread, it returns NULL.
+ * 
+ * @param tn The thread number to assign to the created thread.
+ * @param start_routine The function the new thread should start executing.
+ * @param idles A boolean indicating whether the created thread is an idle thread or not.
+ * @return A pointer to the created MySQL thread.
+ */
 proxysql_mysql_thread_t * MySQL_Threads_Handler::create_thread(unsigned int tn, void *(*start_routine) (void *), bool idles) {
 	if (idles==false) {
 		if (pthread_create(&mysql_threads[tn].thread_id, &attr, start_routine , &mysql_threads[tn]) != 0 ) {
@@ -2600,6 +2676,15 @@ void MySQL_Threads_Handler::update_client_host_cache(struct sockaddr* client_soc
 	}
 }
 
+/**
+ * @brief Flushes the client host cache.
+ * 
+ * This function locks the mutex associated with the client host cache, clears the cache,
+ * and then unlocks the mutex. It is used to remove all entries from the client host cache.
+ * 
+ * @note This function assumes that the mutex_client_host_cache has been initialized 
+ * and is accessible within the MySQL Threads Handler.
+ */
 void MySQL_Threads_Handler::flush_client_host_cache() {
 	pthread_mutex_lock(&mutex_client_host_cache);
 	client_host_cache.clear();
@@ -2617,11 +2702,11 @@ MySQL_Threads_Handler::~MySQL_Threads_Handler() {
 	if (variables.interfaces) free(variables.interfaces);
 	if (variables.server_version) free(variables.server_version);
 	if (variables.keep_multiplexing_variables) free(variables.keep_multiplexing_variables);
+	if (variables.default_authentication_plugin) free(variables.default_authentication_plugin);
 	if (variables.firewall_whitelist_errormsg) free(variables.firewall_whitelist_errormsg);
 	if (variables.init_connect) free(variables.init_connect);
 	if (variables.ldap_user_variable) free(variables.ldap_user_variable);
 	if (variables.add_ldap_user_comment) free(variables.add_ldap_user_comment);
-	if (variables.default_tx_isolation) free(variables.default_tx_isolation);
 	if (variables.default_session_track_gtids) free(variables.default_session_track_gtids);
 	if (variables.eventslog_filename) free(variables.eventslog_filename);
 	if (variables.auditlog_filename) free(variables.auditlog_filename);
@@ -2748,11 +2833,11 @@ MySQL_Thread::~MySQL_Thread() {
 	if (mysql_thread___default_schema) { free(mysql_thread___default_schema); mysql_thread___default_schema=NULL; }
 	if (mysql_thread___server_version) { free(mysql_thread___server_version); mysql_thread___server_version=NULL; }
 	if (mysql_thread___keep_multiplexing_variables) { free(mysql_thread___keep_multiplexing_variables); mysql_thread___keep_multiplexing_variables=NULL; }
+	if (mysql_thread___default_authentication_plugin) { free(mysql_thread___default_authentication_plugin); mysql_thread___default_authentication_plugin=NULL; }
 	if (mysql_thread___firewall_whitelist_errormsg) { free(mysql_thread___firewall_whitelist_errormsg); mysql_thread___firewall_whitelist_errormsg=NULL; }
 	if (mysql_thread___init_connect) { free(mysql_thread___init_connect); mysql_thread___init_connect=NULL; }
 	if (mysql_thread___ldap_user_variable) { free(mysql_thread___ldap_user_variable); mysql_thread___ldap_user_variable=NULL; }
 	if (mysql_thread___add_ldap_user_comment) { free(mysql_thread___add_ldap_user_comment); mysql_thread___add_ldap_user_comment=NULL; }
-	if (mysql_thread___default_tx_isolation) { free(mysql_thread___default_tx_isolation); mysql_thread___default_tx_isolation=NULL; }
 	if (mysql_thread___default_session_track_gtids) { free(mysql_thread___default_session_track_gtids); mysql_thread___default_session_track_gtids=NULL; }
 
 	for (int i=0; i<SQL_NAME_LAST_LOW_WM; i++) {
@@ -2786,6 +2871,10 @@ MySQL_Thread::~MySQL_Thread() {
 		free(match_regexes);
 		match_regexes=NULL;
 	}
+	if (thr_SetParser != NULL) {
+		delete thr_SetParser;
+		thr_SetParser = NULL;
+	}
 
 }
 
@@ -2795,6 +2884,34 @@ MySQL_Session * MySQL_Thread::create_new_session_and_client_data_stream(int _fd)
 	register_session(sess); // register session
 	sess->client_myds = new MySQL_Data_Stream();
 	sess->client_myds->fd=_fd;
+
+	// set not blocking for client connections too!
+	{
+		// PMC-10004
+		// While implementing SSL and fast_forward it was noticed that all frontend connections
+		// are in blocking, although this was never a problem because we call poll() before reading.
+		// Although it became a problem with fast_forward, SSL and large packets because SSL handled
+		// data in chunks of 16KB and there may be data inside SSL even when there is no data
+		// received from the network.
+		// The only modules that seems to be affected by this issue are Admin, SQLite3 Server
+		// and Clickhouse Server
+		int prevflags = fcntl(_fd, F_GETFL, 0);
+		if (prevflags == -1) {
+			proxy_error("For FD %d fcntl() returned -1 errno %d\n", _fd, errno);
+			if (shutdown == 0)
+				assert (prevflags != -1);
+		}
+		int nb = fcntl(_fd, F_SETFL, prevflags | O_NONBLOCK);
+		if (nb == -1) {
+			proxy_error("For FD %d fcntl() returned -1 , previous flags %d , errno %d\n", _fd, prevflags, errno);
+			// previously we were asserting here. But it is possible that this->shutdown is still 0 during the
+			// shutdown itself:
+			// - the current thread is processing connections
+			// - the signal handler thread is still setting shutdown = 0
+			//if (shutdown == 0)
+			//	assert (nb != -1);
+		}
+	}
 	setsockopt(sess->client_myds->fd, IPPROTO_TCP, TCP_NODELAY, (char *) &arg_on, sizeof(arg_on));
 
 	if (mysql_thread___use_tcp_keepalive) {
@@ -2868,12 +2985,13 @@ bool MySQL_Thread::init() {
 	mypolls.add(POLLIN, pipefd[0], NULL, 0);
 	assert(i==0);
 
+	thr_SetParser = new SetParser("");
 	match_regexes=(Session_Regex **)malloc(sizeof(Session_Regex *)*4);
 //	match_regexes[0]=new Session_Regex((char *)"^SET (|SESSION |@@|@@session.)SQL_LOG_BIN( *)(:|)=( *)");
 	match_regexes[0] = NULL; // NOTE: historically we used match_regexes[0] for SET SQL_LOG_BIN . Not anymore
 	
 	std::stringstream ss;
-	ss << "^SET (|SESSION |@@|@@session.)`?(" << mysql_variables.variables_regexp << "SESSION_TRACK_GTIDS|TX_ISOLATION)`?( *)(:|)=( *)";
+	ss << "^SET (|SESSION |@@|@@session.|@@local.)`?(" << mysql_variables.variables_regexp << "SESSION_TRACK_GTIDS|TX_ISOLATION|TX_READ_ONLY|TRANSACTION_ISOLATION|TRANSACTION_READ_ONLY)`?( *)(:|)=( *)";
 	match_regexes[1]=new Session_Regex((char *)ss.str().c_str());
 
 	match_regexes[2]=new Session_Regex((char *)"^SET(?: +)(|SESSION +)TRANSACTION(?: +)(?:(?:(ISOLATION(?: +)LEVEL)(?: +)(REPEATABLE(?: +)READ|READ(?: +)COMMITTED|READ(?: +)UNCOMMITTED|SERIALIZABLE))|(?:(READ)(?: +)(WRITE|ONLY)))");
@@ -2929,6 +3047,18 @@ void MySQL_Thread::unregister_session(int idx) {
 
 
 // this function was inline in MySQL_Thread::run()
+/**
+ * @brief Retrieves multiple idle connections and processes them.
+ * 
+ * This method retrieves multiple idle connections from the MySQL Hostgroup Manager (MyHGM) and processes them.
+ * It updates the number of idle connections (num_idles) based on the retrieved connections. For each idle connection,
+ * it creates a new MySQL session, attaches the connection to the appropriate backend, assigns a file descriptor,
+ * sets necessary parameters, registers the session with the connection handler, and initiates handling.
+ * 
+ * @param num_idles Reference to an integer to store the number of idle connections retrieved.
+ * 
+ * @note This method assumes that MyHGM, my_idle_conns, SESSIONS_FOR_CONNECTIONS_HANDLER, curtime, and relevant MySQL thread variables have been properly initialized and are accessible.
+ */
 void MySQL_Thread::run___get_multiple_idle_connections(int& num_idles) {
 	int i;
 	num_idles=MyHGM->get_multiple_idle_connections(-1, curtime-mysql_thread___ping_interval_server_msec*1000, my_idle_conns, SESSIONS_FOR_CONNECTIONS_HANDLER);
@@ -3009,6 +3139,17 @@ void MySQL_Thread::ProcessAllMyDS_BeforePoll() {
 
 
 // this function was inline in MySQL_Thread::run()
+/**
+ * @brief Processes all MySQL Data Streams after polling.
+ * 
+ * This function iterates through all MySQL polls and processes the associated data streams.
+ * For each poll, it prints debug information about the file descriptor and its events.
+ * If a MySQL Data Stream is associated with the poll, it checks for events on the file descriptor.
+ * If there are no events and a poll timeout is enabled, it checks for sessions timing out.
+ * If there are events, it checks for invalid file descriptors and handles new connections 
+ * for listener type data streams. For other types of data streams, it processes data and 
+ * handles any potential errors.
+ */
 void MySQL_Thread::ProcessAllMyDS_AfterPoll() {
 	for (unsigned int n = 0; n < mypolls.len; n++) {
 		proxy_debug(PROXY_DEBUG_NET,3, "poll for fd %d events %d revents %d\n", mypolls.fds[n].fd , mypolls.fds[n].events, mypolls.fds[n].revents);
@@ -3045,6 +3186,14 @@ void MySQL_Thread::ProcessAllMyDS_AfterPoll() {
 
 
 // this function was inline in MySQL_Thread::run()
+/**
+ * @brief Cleans up the mirror queue by removing excess sessions.
+ * 
+ * This function checks if the length of the mirror queue exceeds the maximum concurrency limit.
+ * If it does, it iteratively removes sessions from the mirror queue until its length matches 
+ * the maximum concurrency limit or falls below it. For each removed session, it updates 
+ * the mirror sessions current count and increments the mirror concurrency gauge accordingly.
+ */
 void MySQL_Thread::run___cleanup_mirror_queue() {
 	unsigned int l = (unsigned int)mysql_thread___mirror_max_concurrency;
 	if (mirror_queue_mysql_sessions_cache->len > l) {
@@ -3057,9 +3206,144 @@ void MySQL_Thread::run___cleanup_mirror_queue() {
 	}
 }
 
-// main loop
-void MySQL_Thread::run() {
+
+#ifdef IDLE_THREADS
+/**
+ * @brief Handles session assignment and retrieval between worker and idle threads.
+ * 
+ * This block of code checks if the global configuration allows idle threads and if the current thread
+ * is not an idle maintenance thread. If both conditions are met, it randomly selects an idle worker thread
+ * and assigns sessions to it. Then, it retrieves sessions from the idle thread.
+ * 
+ * @note This functionality is part of the management of worker and idle threads in the MySQL thread pool.
+ * It facilitates the distribution of sessions between active worker threads and idle threads to optimize resource utilization.
+ * 
+ * @param idle_maintenance_thread Flag indicating whether the current thread is an idle maintenance thread.
+ * @param GloVars Global configuration variables for the MySQL thread.
+ * @param GloMTH Global MySQL thread handlers object.
+ */
+void MySQL_Thread::run_MoveSessionsBetweenThreads() {
+	if (GloVars.global.idle_threads) {
+		int r=rand()%(GloMTH->num_threads);
+		MySQL_Thread *thr=GloMTH->mysql_threads_idles[r].worker;
+		worker_thread_assigns_sessions_to_idle_thread(thr);
+		worker_thread_gets_sessions_from_idle_thread();
+	}
+}
+
+void MySQL_Thread::run_Handle_epoll_wait(int rc) {
+	if (rc) {
+		int i;
+		for (i=0; i<rc; i++) {
+			if (events[i].data.u32) {
+				idle_thread_prepares_session_to_send_to_worker_thread(i);
+			}
+		}
+		// FIXME: this loop seems suboptimal, it can be combined with the previous one
+		for (i=0; i<rc; i++) {
+			if (events[i].events == EPOLLIN && events[i].data.u32==0) {
+				unsigned char c;
+				int fd=pipefd[0];
+				if (read(fd, &c, 1)<=0) {
+				} else {
+					//i=rc;
+					maintenance_loop=true;
+				}
+			}
+		}
+	}
+	if (mysql_sessions->len && maintenance_loop) {
+		if (curtime == last_maintenance_time) {
+			idle_thread_to_kill_idle_sessions();
+		}
+	}
+}
+#endif // IDLE_THREADS
+
+
+void MySQL_Thread::run_BootstrapListener() {
 	unsigned int n;
+	while ( // spin here if ...
+		(n=__sync_add_and_fetch(&mypolls.pending_listener_add,0)) // there is a new listener to add
+		||
+		(GloMTH->bootstrapping_listeners == true) // MySQL_Thread_Handlers has more listeners to configure
+	) {
+		if (n) {
+			poll_listener_add(n);
+			assert(__sync_bool_compare_and_swap(&mypolls.pending_listener_add,n,0));
+		} else {
+			if (GloMTH->bootstrapping_listeners == false) {
+				// we stop looping
+				mypolls.bootstrapping_listeners = false;
+			}
+		}
+#ifdef DEBUG
+		usleep(5+rand()%10);
+#endif
+	}
+}
+
+int MySQL_Thread::run_ComputePollTimeout() {
+	proxy_debug(PROXY_DEBUG_NET, 7, "poll_timeout=%u\n", mypolls.poll_timeout);
+	if (mysql_thread___wait_timeout==0) {
+		// we should be going into PAUSE mode
+		if (mypolls.poll_timeout==0 || mypolls.poll_timeout > 100000) {
+			mypolls.poll_timeout=100000;
+		}
+	}
+	proxy_debug(PROXY_DEBUG_NET, 7, "poll_timeout=%u\n", mypolls.poll_timeout);
+
+
+	pre_poll_time=curtime;
+	int ttw = ( mypolls.poll_timeout ? ( mypolls.poll_timeout/1000 < (unsigned int) mysql_thread___poll_timeout ? mypolls.poll_timeout/1000 : mysql_thread___poll_timeout ) : mysql_thread___poll_timeout );
+	return ttw;
+}
+
+
+void MySQL_Thread::run_StopListener() {
+	unsigned int n;
+	while ((n=__sync_add_and_fetch(&mypolls.pending_listener_del,0))) {	// spin here
+		if (static_cast<int>(n) == -1) {
+			for (unsigned int i = 0; i < mypolls.len; i++) {
+				if (mypolls.myds[i] && mypolls.myds[i]->myds_type == MYDS_LISTENER) {
+					poll_listener_del(mypolls.myds[i]->fd);
+				}
+			}
+		} else {
+			poll_listener_del(n);
+		}
+		assert(__sync_bool_compare_and_swap(&mypolls.pending_listener_del,n,0));
+	}
+}
+
+
+void MySQL_Thread::run_SetAllSession_ToProcess0() {
+	unsigned int n;
+#ifdef IDLE_THREADS
+	// @note: in MySQL_Thread::run we have:  bool idle_maintenance_thread=epoll_thread;
+	// Thus idle_maintenance_thread and epoll_thread are equivalent.
+	if (epoll_thread==false) {
+#endif // IDLE_THREADS
+		for (n=0; n<mysql_sessions->len; n++) {
+			MySQL_Session *_sess=(MySQL_Session *)mysql_sessions->index(n);
+			_sess->to_process=0;
+		}
+#ifdef IDLE_THREADS
+	}
+#endif // IDLE_THREADS
+}
+
+
+// main loop
+/**
+ * @brief Main loop for the MySQL thread.
+ * 
+ * This method represents the main loop executed by the MySQL thread. It performs various tasks including handling idle connections,
+ * processing sessions, performing maintenance, and updating variables. The loop continues executing until shutdown is initiated.
+ * 
+ * @note This method assumes that relevant variables, mutexes, and objects have been properly initialized.
+ */
+void MySQL_Thread::run() {
 	int rc;
 
 #ifdef IDLE_THREADS
@@ -3103,55 +3387,28 @@ __run_skip_1:
 
 		if (idle_maintenance_thread) {
 			idle_thread_gets_sessions_from_worker_thread();
-			goto __run_skip_1a;
-		}
+		} else {
 #endif // IDLE_THREADS
 
-		handle_mirror_queue_mysql_sessions();
+			handle_mirror_queue_mysql_sessions();
 
-		ProcessAllMyDS_BeforePoll();
+			ProcessAllMyDS_BeforePoll();
 
 #ifdef IDLE_THREADS
-		if (GloVars.global.idle_threads) {
-			if (idle_maintenance_thread==false) {
-				int r=rand()%(GloMTH->num_threads);
-				MySQL_Thread *thr=GloMTH->mysql_threads_idles[r].worker;
-				worker_thread_assigns_sessions_to_idle_thread(thr);
-				worker_thread_gets_sessions_from_idle_thread();
-			}
+			run_MoveSessionsBetweenThreads();
 		}
-
-
-__run_skip_1a:
 #endif // IDLE_THREADS
 
 		pthread_mutex_unlock(&thread_mutex);
-		while ( // spin here if ...
-			(n=__sync_add_and_fetch(&mypolls.pending_listener_add,0)) // there is a new listener to add
-			||
-			(GloMTH->bootstrapping_listeners == true) // MySQL_Thread_Handlers has more listeners to configure
-		) {
-			if (n) {
-				poll_listener_add(n);
-				assert(__sync_bool_compare_and_swap(&mypolls.pending_listener_add,n,0));
-			}
+		if (unlikely(mypolls.bootstrapping_listeners == true)) {
+			run_BootstrapListener();
 		}
-
-		proxy_debug(PROXY_DEBUG_NET, 7, "poll_timeout=%llu\n", mypolls.poll_timeout);
-		if (mysql_thread___wait_timeout==0) {
-			// we should be going into PAUSE mode
-			if (mypolls.poll_timeout==0 || mypolls.poll_timeout > 100000) {
-				mypolls.poll_timeout=100000;
-			}
-		}
-		proxy_debug(PROXY_DEBUG_NET, 7, "poll_timeout=%llu\n", mypolls.poll_timeout);
-
 
 		// flush mysql log file
 		GloMyLogger->flush();
 
-		pre_poll_time=curtime;
-		int ttw = ( mypolls.poll_timeout ? ( mypolls.poll_timeout/1000 < (unsigned int) mysql_thread___poll_timeout ? mypolls.poll_timeout/1000 : mysql_thread___poll_timeout ) : mysql_thread___poll_timeout );
+		int ttw = run_ComputePollTimeout();
+
 #ifdef IDLE_THREADS
 		if (GloVars.global.idle_threads && idle_maintenance_thread) {
 			memset(events,0,sizeof(struct epoll_event)*MY_EPOLL_THREAD_MAXEVENTS); // let's make valgrind happy. It also seems that needs to be zeroed anyway
@@ -3168,17 +3425,10 @@ __run_skip_1a:
 		}
 #endif // IDLE_THREADS
 
-		while ((n=__sync_add_and_fetch(&mypolls.pending_listener_del,0))) {	// spin here
-			if (static_cast<int>(n) == -1) {
-				for (unsigned int i = 0; i < mypolls.len; i++) {
-					if (mypolls.myds[i] && mypolls.myds[i]->myds_type == MYDS_LISTENER) {
-						poll_listener_del(mypolls.myds[i]->fd);
-					}
-				}
-			} else {
-				poll_listener_del(n);
+		if (unlikely(maintenance_loop == true)) {
+			if (unlikely(__sync_add_and_fetch(&mypolls.pending_listener_del,0))) {
+				run_StopListener();
 			}
-			assert(__sync_bool_compare_and_swap(&mypolls.pending_listener_del,n,0));
 		}
 
 		pthread_mutex_lock(&thread_mutex);
@@ -3219,7 +3469,14 @@ __run_skip_1a:
 		mypolls.loops++;
 		mypolls.loop_counters->incr(curtime/1000000);
 
-		if (maintenance_loop) {
+		if (maintenance_loop == true
+#ifdef IDLE_THREADS
+		// in case of idle thread
+		// do not run any mirror cleanup and do not
+		// update query processor stats
+		&& idle_maintenance_thread == false
+#endif // IDLE_THREADS
+		) {
 			// house keeping
 			run___cleanup_mirror_queue();
 			GloQPro->update_query_processor_stats();
@@ -3240,55 +3497,12 @@ __run_skip_1a:
 			refresh_variables();
 		}
 
-#ifdef IDLE_THREADS
-		if (idle_maintenance_thread==false) {
-#endif // IDLE_THREADS
-			for (n=0; n<mysql_sessions->len; n++) {
-				MySQL_Session *_sess=(MySQL_Session *)mysql_sessions->index(n);
-				_sess->to_process=0;
-			}
-#ifdef IDLE_THREADS
-		}
-#endif // IDLE_THREADS
+		run_SetAllSession_ToProcess0();
 
 #ifdef IDLE_THREADS
 		// here we handle epoll_wait()
 		if (GloVars.global.idle_threads && idle_maintenance_thread) {
-			if (rc) {
-				int i;
-				for (i=0; i<rc; i++) {
-					if (events[i].data.u32) {
-						idle_thread_prepares_session_to_send_to_worker_thread(i);
-					}
-				}
-				// FIXME: this loop seems suboptimal, it can be combined with the previous one
-				for (i=0; i<rc; i++) {
-					if (events[i].events == EPOLLIN && events[i].data.u32==0) {
-						unsigned char c;
-						int fd=pipefd[0];
-						if (read(fd, &c, 1)<=0) {
-						} else {
-							//i=rc;
-							maintenance_loop=true;
-						}
-					}
-				}
-			}
-			if (mysql_sessions->len && maintenance_loop) {
-				if (curtime == last_maintenance_time) {
-					idle_thread_to_kill_idle_sessions();
-				}
-			}
-			goto __run_skip_2;
-		}
-#endif // IDLE_THREADS
-
-		ProcessAllMyDS_AfterPoll();
-
-#ifdef IDLE_THREADS
-__run_skip_2:
-		if (GloVars.global.idle_threads && idle_maintenance_thread) {
-			// this is an idle thread
+			run_Handle_epoll_wait(rc);
 			unsigned int w=rand()%(GloMTH->num_threads);
 			MySQL_Thread *thr=GloMTH->mysql_threads[w].worker;
 			if (resume_mysql_sessions->len) {
@@ -3298,19 +3512,20 @@ __run_skip_2:
 			}
 		} else {
 #endif // IDLE_THREADS
+			ProcessAllMyDS_AfterPoll();
 			// iterate through all sessions and process the session logic
 			process_all_sessions();
-
 			return_local_connections();
 #ifdef IDLE_THREADS
 		}
 #endif // IDLE_THREADS
+
 	}
 }
 // end of ::run()
 
 unsigned int MySQL_Thread::find_session_idx_in_mysql_sessions(MySQL_Session *sess) {
-	int i=0;
+	unsigned int i=0;
 	for (i=0;i<mysql_sessions->len;i++) {
 		MySQL_Session *mysess=(MySQL_Session *)mysql_sessions->index(i);
 		if (mysess==sess) {
@@ -3321,6 +3536,20 @@ unsigned int MySQL_Thread::find_session_idx_in_mysql_sessions(MySQL_Session *ses
 }
 
 #ifdef IDLE_THREADS
+
+/**
+ * @brief Moves idle threads to kill idle sessions.
+ * 
+ * This function iterates through a portion of MySQL sessions to scan for idle sessions.
+ * If the current time exceeds the wait timeout threshold, it marks sessions idle for longer
+ * than the timeout as killed. It then removes the killed sessions from the session map,
+ * adjusts the map if necessary, unregisters the sessions, and adds them to the list of
+ * sessions to be resumed. Additionally, it removes associated data streams from the poll list
+ * and epoll control, updating relevant indices and pointers.
+ * 
+ * @note This function assumes that MySQL sessions and related data structures have been
+ * initialized and are accessible within the MySQL Thread.
+ */
 void MySQL_Thread::idle_thread_to_kill_idle_sessions() {
 #define	SESS_TO_SCAN	128
 	if (mysess_idx + SESS_TO_SCAN > mysql_sessions->len) {
@@ -3396,6 +3625,17 @@ void MySQL_Thread::idle_thread_check_if_worker_thread_has_unprocess_resumed_sess
 	pthread_mutex_unlock(&thr->myexchange.mutex_resumes);
 }
 
+/**
+ * @brief Assigns idle sessions to a worker thread for processing.
+ * 
+ * This function is executed by an idle thread to assign idle sessions to a specified worker thread
+ * for processing. It locks the mutex associated with the worker thread's session exchange mechanism,
+ * checks if there are sessions to resume, and if so, transfers them to the worker thread's list
+ * of sessions to resume. After transferring sessions, it determines whether to send a signal to the
+ * worker thread to inform it of the presence of new sessions.
+ * 
+ * @param thr The worker thread to which idle sessions will be assigned.
+ */
 void MySQL_Thread::idle_thread_assigns_sessions_to_worker_thread(MySQL_Thread *thr) {
 	bool send_signal = false;
 	// send_signal variable will control if we need to signal or not
@@ -3421,6 +3661,18 @@ void MySQL_Thread::idle_thread_assigns_sessions_to_worker_thread(MySQL_Thread *t
 	}
 }
 
+/**
+ * @brief Assigns idle sessions to an idle thread for processing.
+ * 
+ * This function is executed by a worker thread to assign idle sessions to a specified idle thread
+ * for processing. It checks if both the current thread and the idle thread are not in shutdown mode,
+ * and if there are idle sessions to assign. If conditions are met, it locks the mutex associated with
+ * the idle thread's session exchange mechanism, transfers idle sessions to the idle thread's list of
+ * sessions to process, and sends a signal to the idle thread if its session queue was empty before
+ * transferring sessions.
+ * 
+ * @param thr The idle thread to which idle sessions will be assigned.
+ */
 void MySQL_Thread::worker_thread_assigns_sessions_to_idle_thread(MySQL_Thread *thr) {
 	if (shutdown==0 && thr->shutdown==0 && idle_mysql_sessions->len) {
 		pthread_mutex_lock(&thr->myexchange.mutex_idles);
@@ -3444,18 +3696,31 @@ void MySQL_Thread::worker_thread_assigns_sessions_to_idle_thread(MySQL_Thread *t
 	}
 }
 
+/**
+ * @brief Worker thread retrieves sessions from the idle thread for processing.
+ * 
+ * This function is executed by a worker thread to retrieve sessions from the idle thread
+ * for processing. It locks the mutex associated with the session exchange mechanism,
+ * checks if there are sessions to resume, and if so, retrieves them from the idle thread's
+ * list of sessions to be resumed. For each retrieved session, it registers the session,
+ * adds its associated data stream to the poll list for monitoring read events, and updates
+ * the poll timestamp. After processing all available sessions, it unlocks the mutex.
+ * 
+ * @note This function assumes that the worker thread's session exchange mechanism has been
+ * initialized and is accessible within the MySQL Thread.
+ */
 void MySQL_Thread::worker_thread_gets_sessions_from_idle_thread() {
-				pthread_mutex_lock(&myexchange.mutex_resumes);
-				if (myexchange.resume_mysql_sessions->len) {
-					//unsigned int maxsess=GloMTH->resume_mysql_sessions->len;
-					while (myexchange.resume_mysql_sessions->len) {
-						MySQL_Session *mysess=(MySQL_Session *)myexchange.resume_mysql_sessions->remove_index_fast(0);
-						register_session(mysess, false);
-						MySQL_Data_Stream *myds=mysess->client_myds;
-						mypolls.add(POLLIN, myds->fd, myds, monotonic_time());
-					}
-				}
-				pthread_mutex_unlock(&myexchange.mutex_resumes);
+	pthread_mutex_lock(&myexchange.mutex_resumes);
+	if (myexchange.resume_mysql_sessions->len) {
+		//unsigned int maxsess=GloMTH->resume_mysql_sessions->len;
+		while (myexchange.resume_mysql_sessions->len) {
+			MySQL_Session *mysess=(MySQL_Session *)myexchange.resume_mysql_sessions->remove_index_fast(0);
+			register_session(mysess, false);
+			MySQL_Data_Stream *myds=mysess->client_myds;
+			mypolls.add(POLLIN, myds->fd, myds, monotonic_time());
+		}
+	}
+	pthread_mutex_unlock(&myexchange.mutex_resumes);
 }
 #endif // IDLE_THREADS
 
@@ -3529,17 +3794,42 @@ bool MySQL_Thread::process_data_on_data_stream(MySQL_Data_Stream *myds, unsigned
 
 							if (rb > 0 && myds->myds_type == MYDS_BACKEND) {
 								if (myds->sess->session_fast_forward) {
-									struct pollfd _fds;
-									nfds_t _nfds = 1;
-									_fds.fd = mypolls.fds[n].fd;
-									_fds.events = POLLIN;
-									_fds.revents = 0;
-									int _rc = poll(&_fds, _nfds, 0);
-									if ((_rc > 0) && _fds.revents == POLLIN) {
-										// there is more data
-										myds->revents = _fds.revents;
-									} else {
+									if (myds->encrypted == true) { // we are in fast_forward mode and encrypted == true
+										// PMC-10004
+										// we probably should use SSL_pending() and/or SSL_has_pending() to determine
+										// if there is more data to be read, but it doesn't seem to be working.
+										// Therefore we try to call read_from_net() again as long as there is data.
+										// Previously we hardcoded 16KB but it seems that it can return in smaller
+										// chunks of 4KB.
+										// We finally removed the chunk size as it seems that any size is possible.
+/*
+										int sslp = SSL_pending(myds->ssl);
+										int sslhp = SSL_has_pending(myds->ssl);
+										proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p: in fast_forward mode and SSL read %d bytes , SSL_pending: %d bytes , SSL_has_pending: %d\n", myds->sess, rb, sslp, sslhp);
+*/
+										proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p, DataStream=%p , thread_session_id=%u -- in fast_forward mode and SSL read %d bytes\n", myds->sess, myds, myds->sess->thread_session_id, rb);
+										while (rb > 0) {
+											rb = myds->read_from_net();
+											if (rb > 0 && myds->myds_type == MYDS_FRONTEND) {
+												status_variables.stvar[st_var_queries_frontends_bytes_recv] += rb;
+											}
+											proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p, DataStream=%p -- in fast_forward mode and SSL read %d bytes\n", myds->sess, myds, rb);
+											myds->read_pkts();
+										}
 										rb = 0; // exit loop
+									} else { // we are in fast_forward mode and encrypted == false
+										struct pollfd _fds;
+										nfds_t _nfds = 1;
+										_fds.fd = mypolls.fds[n].fd;
+										_fds.events = POLLIN;
+										_fds.revents = 0;
+										int _rc = poll(&_fds, _nfds, 0);
+										if ((_rc > 0) && _fds.revents == POLLIN) {
+											// there is more data
+											myds->revents = _fds.revents;
+										} else {
+											rb = 0; // exit loop
+										}
 									}
 								} else {
 									rb = 0; // exit loop
@@ -3595,6 +3885,16 @@ bool MySQL_Thread::process_data_on_data_stream(MySQL_Data_Stream *myds, unsigned
 
 
 // this function was inline in  MySQL_Thread::process_all_sessions()
+/**
+ * @brief Sort all sessions based on maximum connection time.
+ * 
+ * This function iterates through all MySQL sessions and sorts them based on their maximum connection time.
+ * Sessions with a valid maximum connection time are compared, and if one session has a greater maximum connection
+ * time than another, their positions in the session list are swapped. The sorting is performed in-place.
+ * 
+ * @note This function assumes that MySQL sessions and their associated data structures have been initialized
+ * and are accessible within the MySQL Thread.
+ */
 void MySQL_Thread::ProcessAllSessions_SortingSessions() {
 	unsigned int a=0;
 	for (unsigned int n=0; n<mysql_sessions->len; n++) {
@@ -3642,23 +3942,39 @@ void MySQL_Thread::ProcessAllSessions_CompletedMirrorSession(unsigned int& n, My
 
 
 // this function was inline in MySQL_Thread::process_all_sessions()
+/**
+ * @brief Processes a session in the maintenance loop.
+ * 
+ * This function performs maintenance tasks for a session within the maintenance loop. It handles checks related to session
+ * timeouts, active transactions, and server table version changes. Depending on the conditions, it may kill the session,
+ * simulate data in failed backend connections, or update expired connections if multiplexing is enabled.
+ * 
+ * @param sess The MySQL session to process.
+ * @param sess_time The time elapsed since the session started, in milliseconds.
+ * @param total_active_transactions_ Reference to the total number of active transactions across all sessions.
+ */
 void MySQL_Thread::ProcessAllSessions_MaintenanceLoop(MySQL_Session *sess, unsigned long long sess_time, unsigned int& total_active_transactions_) {
 	unsigned int numTrx=0;
-	sess->active_transactions=sess->NumActiveTransactions();
-	{
-		unsigned long long sess_active_transactions = sess->active_transactions;
-		sess->active_transactions=sess->NumActiveTransactions();
-		// in case we detected a new transaction just now
-		if (sess->active_transactions == 0) {
-			sess->transaction_started_at = 0;
-		} else {
-			if (sess->transaction_started_at == 0) {
-				sess->transaction_started_at = curtime;
-			}
-		}
-	}
 	total_active_transactions_ += sess->active_transactions;
 	sess->to_process=1;
+	/**
+	 * @brief Handles session timeout conditions and associated actions.
+	 * 
+	 * This block of code evaluates whether the session has exceeded either the maximum transaction idle time
+	 * or the wait timeout duration. If either condition is met, it takes appropriate action:
+	 * 
+	 * - If the session has active transactions, it checks if the maximum transaction time has been exceeded
+	 *   and kills the session if necessary.
+	 * - If the session does not have active transactions, it kills the session if it has been inactive for longer
+	 *   than the wait timeout duration.
+	 * 
+	 * If none of the timeout conditions are met, it continues to evaluate the session's active transactions
+	 * against the maximum transaction time criteria and kills the session if necessary.
+	 * 
+	 * @param sess_time The time elapsed since the session started, in milliseconds.
+	 * @param curtime The current time, in milliseconds.
+	 * @param sess The MySQL session to handle.
+	 */
 	if ( (sess_time/1000 > (unsigned long long)mysql_thread___max_transaction_idle_time) || (sess_time/1000 > (unsigned long long)mysql_thread___wait_timeout) ) {
 		//numTrx = sess->NumActiveTransactions();
 		numTrx = sess->active_transactions;
@@ -3695,6 +4011,18 @@ void MySQL_Thread::ProcessAllSessions_MaintenanceLoop(MySQL_Session *sess, unsig
 			}
 		}
 	}
+	/**
+	 * @brief Handles server table version change and its associated actions.
+	 * 
+	 * This block of code checks if the current server table version differs from the previous version,
+	 * indicating a change in server configurations. If there is a change, it performs the following actions:
+	 * 
+	 * - If the session is in fast forward mode and has offline backends, it immediately kills the client connection.
+	 * - If the session is not in fast forward mode, it searches for connections that should be terminated,
+	 *   and simulates data in them by failing the backend connections instead of killing the sessions.
+	 * 
+	 * This block also addresses bug fix #1085 related to handling client connections using an OFFLINE node.
+	 */
 	if (servers_table_version_current != servers_table_version_previous) { // bug fix for #1085
 		// Immediatelly kill all client connections using an OFFLINE node when session_fast_forward == true
 		if (sess->session_fast_forward) {
@@ -3711,8 +4039,91 @@ void MySQL_Thread::ProcessAllSessions_MaintenanceLoop(MySQL_Session *sess, unsig
 			}
 		}
 	}
+
+	// Perform the maintenance for expired connections on the session
+
+	/**
+	 * @brief Checks for expired connections and updates them if multiplexing is enabled.
+	 * 
+	 * If multiplexing is enabled, this block of code defines lambda functions to check for expired connections
+	 * based on auto-increment delay and connection delay multiplexing criteria. It then creates a vector of these
+	 * functions and passes it to the `update_expired_conns` method of the session object to update expired connections.
+	 */
+	if (mysql_thread___multiplexing) {
+		const auto auto_incr_delay_multiplex_check = [curtime=this->curtime] (MySQL_Connection* myconn) -> bool {
+			const uint64_t multiplex_timeout_ms = mysql_thread___auto_increment_delay_multiplex_timeout_ms;
+			const bool multiplex_delayed_enabled = multiplex_timeout_ms != 0 && myconn->auto_increment_delay_token > 0;
+			const bool timeout_expired = multiplex_delayed_enabled && myconn->myds->wait_until != 0 && myconn->myds->wait_until < curtime;
+			return timeout_expired;
+		};
+
+		const auto conn_delay_multiplex = [curtime=this->curtime] (MySQL_Connection* myconn) -> bool {
+			const bool multiplex_delayed = mysql_thread___connection_delay_multiplex_ms != 0 && myconn->multiplex_delayed == true;
+			const bool timeout_expired = multiplex_delayed && myconn->myds->wait_until != 0 && myconn->myds->wait_until < curtime;
+			return timeout_expired;
+		};
+
+		const vector<function<bool(MySQL_Connection*)>> expire_conn_checks {
+			auto_incr_delay_multiplex_check,
+			conn_delay_multiplex
+		};
+
+		sess->update_expired_conns(expire_conn_checks);
+	}
 }
 
+
+void MySQL_Thread::ProcessAllSessions_Healthy0(MySQL_Session *sess, unsigned int& n) {
+	char _buf[1024];
+	if (sess->client_myds) {
+		if (mysql_thread___log_unhealthy_connections) {
+			if (sess->session_fast_forward == false) {
+				proxy_warning(
+					"Closing unhealthy client connection %s:%d\n", sess->client_myds->addr.addr,
+					sess->client_myds->addr.port
+				);
+			} else {
+				proxy_warning(
+					"Closing 'fast_forward' client connection %s:%d\n", sess->client_myds->addr.addr,
+					sess->client_myds->addr.port
+				);
+			}
+		}
+	}
+	sprintf(_buf,"%s:%d:%s()", __FILE__, __LINE__, __func__);
+	GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_CLOSE, sess, NULL, _buf);
+	unregister_session(n);
+	n--;
+	delete sess;
+}
+
+/**
+ * @brief Processes all active sessions within the MySQL thread.
+ * 
+ * This function iterates through all active sessions within the MySQL thread and performs various actions based on the session state and conditions.
+ * 
+ * If the session sorting flag is enabled and there are more than three sessions, it sorts the sessions.
+ * 
+ * For each session, it performs the following tasks:
+ * - Checks if the session is a mirror session and handles completed mirror sessions accordingly.
+ * - Handles client connection establishment timeout if the session is in the CONNECTING_CLIENT state.
+ * - Executes maintenance tasks on sessions if the MySQL thread is in maintenance mode.
+ * - Handles unhealthy sessions by closing them and logging audit entries.
+ * - Executes the session handler if it needs processing and is not paused, handling session termination if needed.
+ * 
+ * After processing all sessions, if the MySQL thread is in maintenance mode, it updates the total active transactions.
+ * 
+ * @param sess_sort Flag indicating whether session sorting is enabled.
+ * @param mysql_sessions Pointer to the list of MySQL sessions.
+ * @param mysql_thread___connect_timeout_client Timeout value for establishing client connections.
+ * @param mysql_thread___wait_timeout Timeout value for inactive sessions.
+ * @param mysql_thread___log_unhealthy_connections Flag indicating whether to log unhealthy connections.
+ * @param curtime Current timestamp.
+ * @param maintenance_loop Flag indicating whether the MySQL thread is in maintenance mode.
+ * @param status_variables Struct containing status variables for the MySQL thread.
+ * @param total_active_transactions_ Reference variable to store the total active transactions.
+ * @param rc Variable to store the return code of session handlers.
+ */
 void MySQL_Thread::process_all_sessions() {
 	unsigned int n;
 	unsigned int total_active_transactions_=0;
@@ -3775,18 +4186,8 @@ void MySQL_Thread::process_all_sessions() {
 			// removing this logic in 2.0.15
 			//sess->active_transactions = -1;
 		}
-		if (sess->healthy==0) {
-			char _buf[1024];
-			if (sess->client_myds) {
-				if (mysql_thread___log_unhealthy_connections) {
-					proxy_warning("Closing unhealthy client connection %s:%d\n",sess->client_myds->addr.addr,sess->client_myds->addr.port);
-				}
-			}
-			sprintf(_buf,"%s:%d:%s()", __FILE__, __LINE__, __func__);
-			GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_CLOSE, sess, NULL, _buf);
-			unregister_session(n);
-			n--;
-			delete sess;
+		if (unlikely(sess->healthy==0)) {
+			ProcessAllSessions_Healthy0(sess, n);
 		} else {
 			if (sess->to_process==1) {
 				if (sess->pause_until <= curtime) {
@@ -3804,7 +4205,7 @@ void MySQL_Thread::process_all_sessions() {
 					}
 				}
 			} else {
-				if (sess->killed==true) {
+				if (unlikely(sess->killed==true)) {
 					// this is a special cause, if killed the session needs to be executed no matter if paused
 					sess->handler();
 					char _buf[1024];
@@ -3826,6 +4227,20 @@ void MySQL_Thread::process_all_sessions() {
 	}
 }
 
+
+/**
+ * @brief Refreshes MySQL thread variables from global MySQL thread handler.
+ * 
+ * This method locks the global MySQL thread handler mutex and refreshes various MySQL thread variables
+ * from the global MySQL thread handler. It retrieves values for variables such as maximum allowed packet size,
+ * automatic SQL injection detection, firewall whitelist status, TCP keepalive usage, TCP keepalive time,
+ * connection throttling per second to host groups, maximum transaction idle time, maximum transaction time,
+ * threshold query length, threshold result set size, maximum query digest length, maximum query length for digests,
+ * wait timeout, default variables, replication lag evaluation on server load, and session debugging mode.
+ * 
+ * @note This method assumes that the global MySQL thread handler (GloMTH) and relevant variables such as
+ * mysql_thread___default_variables have been properly initialized and are accessible.
+ */
 void MySQL_Thread::refresh_variables() {
 	pthread_mutex_lock(&GloVars.global.ext_glomth_mutex);
 	if (GloMTH==NULL) {
@@ -3833,119 +4248,111 @@ void MySQL_Thread::refresh_variables() {
 	}
 	GloMTH->wrlock();
 	__thread_MySQL_Thread_Variables_version=__global_MySQL_Thread_Variables_version;
-	mysql_thread___max_allowed_packet=GloMTH->get_variable_int((char *)"max_allowed_packet");
-	mysql_thread___automatic_detect_sqli=(bool)GloMTH->get_variable_int((char *)"automatic_detect_sqli");
-	mysql_thread___firewall_whitelist_enabled=(bool)GloMTH->get_variable_int((char *)"firewall_whitelist_enabled");
-	mysql_thread___use_tcp_keepalive=(bool)GloMTH->get_variable_int((char *)"use_tcp_keepalive");
-	mysql_thread___tcp_keepalive_time=GloMTH->get_variable_int((char *)"tcp_keepalive_time");
-	mysql_thread___throttle_connections_per_sec_to_hostgroup=GloMTH->get_variable_int((char *)"throttle_connections_per_sec_to_hostgroup");
-	mysql_thread___max_transaction_idle_time=GloMTH->get_variable_int((char *)"max_transaction_idle_time");
-	mysql_thread___max_transaction_time=GloMTH->get_variable_int((char *)"max_transaction_time");
-	mysql_thread___threshold_query_length=GloMTH->get_variable_int((char *)"threshold_query_length");
-	mysql_thread___threshold_resultset_size=GloMTH->get_variable_int((char *)"threshold_resultset_size");
-	mysql_thread___query_digests_max_digest_length=GloMTH->get_variable_int((char *)"query_digests_max_digest_length");
-	mysql_thread___query_digests_max_query_length=GloMTH->get_variable_int((char *)"query_digests_max_query_length");
-	mysql_thread___wait_timeout=GloMTH->get_variable_int((char *)"wait_timeout");
-	mysql_thread___throttle_max_bytes_per_second_to_client=GloMTH->get_variable_int((char *)"throttle_max_bytes_per_second_to_client");
-	mysql_thread___throttle_ratio_server_to_client=GloMTH->get_variable_int((char *)"throttle_ratio_server_to_client");
-	mysql_thread___max_connections=GloMTH->get_variable_int((char *)"max_connections");
-	mysql_thread___max_stmts_per_connection=GloMTH->get_variable_int((char *)"max_stmts_per_connection");
-	mysql_thread___max_stmts_cache=GloMTH->get_variable_int((char *)"max_stmts_cache");
-	mysql_thread___mirror_max_concurrency=GloMTH->get_variable_int((char *)"mirror_max_concurrency");
-	mysql_thread___mirror_max_queue_length=GloMTH->get_variable_int((char *)"mirror_max_queue_length");
-	mysql_thread___default_query_delay=GloMTH->get_variable_int((char *)"default_query_delay");
-	mysql_thread___default_query_timeout=GloMTH->get_variable_int((char *)"default_query_timeout");
-	mysql_thread___query_processor_iterations=GloMTH->get_variable_int((char *)"query_processor_iterations");
-	mysql_thread___query_processor_regex=GloMTH->get_variable_int((char *)"query_processor_regex");
-	mysql_thread___set_query_lock_on_hostgroup=GloMTH->get_variable_int((char *)"set_query_lock_on_hostgroup");
-	mysql_thread___reset_connection_algorithm=GloMTH->get_variable_int((char *)"reset_connection_algorithm");
-	mysql_thread___auto_increment_delay_multiplex=GloMTH->get_variable_int((char *)"auto_increment_delay_multiplex");
-	mysql_thread___default_max_latency_ms=GloMTH->get_variable_int((char *)"default_max_latency_ms");
-	mysql_thread___long_query_time=GloMTH->get_variable_int((char *)"long_query_time");
-	mysql_thread___query_cache_size_MB=GloMTH->get_variable_int((char *)"query_cache_size_MB");
-	mysql_thread___ping_interval_server_msec=GloMTH->get_variable_int((char *)"ping_interval_server_msec");
-	mysql_thread___ping_timeout_server=GloMTH->get_variable_int((char *)"ping_timeout_server");
-	mysql_thread___shun_on_failures=GloMTH->get_variable_int((char *)"shun_on_failures");
-	mysql_thread___shun_recovery_time_sec=GloMTH->get_variable_int((char *)"shun_recovery_time_sec");
-	mysql_thread___unshun_algorithm=GloMTH->get_variable_int((char *)"unshun_algorithm");
-	mysql_thread___query_retries_on_failure=GloMTH->get_variable_int((char *)"query_retries_on_failure");
-	mysql_thread___connect_retries_on_failure=GloMTH->get_variable_int((char *)"connect_retries_on_failure");
-	mysql_thread___connection_delay_multiplex_ms=GloMTH->get_variable_int((char *)"connection_delay_multiplex_ms");
-	mysql_thread___connection_max_age_ms=GloMTH->get_variable_int((char *)"connection_max_age_ms");
-	mysql_thread___connect_timeout_client=GloMTH->get_variable_int((char *)"connect_timeout_client");
-	mysql_thread___connect_timeout_server=GloMTH->get_variable_int((char *)"connect_timeout_server");
-	mysql_thread___connect_timeout_server_max=GloMTH->get_variable_int((char *)"connect_timeout_server_max");
-	mysql_thread___free_connections_pct=GloMTH->get_variable_int((char *)"free_connections_pct");
+	REFRESH_VARIABLE_INT (max_allowed_packet);
+	REFRESH_VARIABLE_BOOL(automatic_detect_sqli);
+	REFRESH_VARIABLE_BOOL(firewall_whitelist_enabled);
+	REFRESH_VARIABLE_BOOL(use_tcp_keepalive);
+	REFRESH_VARIABLE_INT(tcp_keepalive_time);
+	REFRESH_VARIABLE_INT(throttle_connections_per_sec_to_hostgroup);
+	REFRESH_VARIABLE_INT(max_transaction_idle_time);
+	REFRESH_VARIABLE_INT(max_transaction_time);
+	REFRESH_VARIABLE_INT(threshold_query_length);
+	REFRESH_VARIABLE_INT(threshold_resultset_size);
+	REFRESH_VARIABLE_INT(query_digests_max_digest_length);
+	REFRESH_VARIABLE_INT(query_digests_max_query_length);
+	REFRESH_VARIABLE_INT(wait_timeout);
+	REFRESH_VARIABLE_INT(throttle_max_bytes_per_second_to_client);
+	REFRESH_VARIABLE_INT(throttle_ratio_server_to_client);
+	REFRESH_VARIABLE_INT(max_connections);
+	REFRESH_VARIABLE_INT(max_stmts_per_connection);
+	REFRESH_VARIABLE_INT(max_stmts_cache);
+	REFRESH_VARIABLE_INT(mirror_max_concurrency);
+	REFRESH_VARIABLE_INT(mirror_max_queue_length);
+	REFRESH_VARIABLE_INT(default_query_delay);
+	REFRESH_VARIABLE_INT(default_query_timeout);
+	REFRESH_VARIABLE_INT(query_processor_iterations);
+	REFRESH_VARIABLE_INT(query_processor_regex);
+	REFRESH_VARIABLE_INT(set_query_lock_on_hostgroup);
+	REFRESH_VARIABLE_INT(set_parser_algorithm);
+	REFRESH_VARIABLE_INT(reset_connection_algorithm);
+	REFRESH_VARIABLE_INT(auto_increment_delay_multiplex);
+	REFRESH_VARIABLE_INT(auto_increment_delay_multiplex_timeout_ms);
+	REFRESH_VARIABLE_INT(default_max_latency_ms);
+	REFRESH_VARIABLE_INT(long_query_time);
+	REFRESH_VARIABLE_INT(query_cache_size_MB);
+	REFRESH_VARIABLE_INT(query_cache_soft_ttl_pct);
+	REFRESH_VARIABLE_INT(query_cache_handle_warnings);
+	REFRESH_VARIABLE_INT(ping_interval_server_msec);
+	REFRESH_VARIABLE_INT(ping_timeout_server);
+	REFRESH_VARIABLE_INT(shun_on_failures);
+	REFRESH_VARIABLE_INT(shun_recovery_time_sec);
+	REFRESH_VARIABLE_INT(unshun_algorithm);
+	REFRESH_VARIABLE_INT(query_retries_on_failure);
+	REFRESH_VARIABLE_INT(connect_retries_on_failure);
+	REFRESH_VARIABLE_INT(connection_delay_multiplex_ms);
+	REFRESH_VARIABLE_INT(connection_max_age_ms);
+	REFRESH_VARIABLE_INT(connect_timeout_client);
+	REFRESH_VARIABLE_INT(connect_timeout_server);
+	REFRESH_VARIABLE_INT(connect_timeout_server_max);
+	REFRESH_VARIABLE_INT(free_connections_pct);
 #ifdef IDLE_THREADS
-	mysql_thread___session_idle_ms=GloMTH->get_variable_int((char *)"session_idle_ms");
+	REFRESH_VARIABLE_INT(session_idle_ms);
 #endif // IDLE_THREADS
-	mysql_thread___connect_retries_delay=GloMTH->get_variable_int((char *)"connect_retries_delay");
+	REFRESH_VARIABLE_INT(connect_retries_delay);
 
-	if (mysql_thread___monitor_username) free(mysql_thread___monitor_username);
-	mysql_thread___monitor_username=GloMTH->get_variable_string((char *)"monitor_username");
-	if (mysql_thread___monitor_password) free(mysql_thread___monitor_password);
-	mysql_thread___monitor_password=GloMTH->get_variable_string((char *)"monitor_password");
-	if (mysql_thread___monitor_replication_lag_use_percona_heartbeat) free(mysql_thread___monitor_replication_lag_use_percona_heartbeat);
-	mysql_thread___monitor_replication_lag_use_percona_heartbeat=GloMTH->get_variable_string((char *)"monitor_replication_lag_use_percona_heartbeat");
+	REFRESH_VARIABLE_CHAR(monitor_username);
+	REFRESH_VARIABLE_CHAR(monitor_password);
+	REFRESH_VARIABLE_CHAR(monitor_replication_lag_use_percona_heartbeat);
 
 	// SSL proxy to server
-	if (mysql_thread___ssl_p2s_ca) free(mysql_thread___ssl_p2s_ca);
-	mysql_thread___ssl_p2s_ca=GloMTH->get_variable_string((char *)"ssl_p2s_ca");
-	if (mysql_thread___ssl_p2s_capath) free(mysql_thread___ssl_p2s_capath);
-	mysql_thread___ssl_p2s_capath=GloMTH->get_variable_string((char *)"ssl_p2s_ca");
-	if (mysql_thread___ssl_p2s_cert) free(mysql_thread___ssl_p2s_cert);
-	mysql_thread___ssl_p2s_cert=GloMTH->get_variable_string((char *)"ssl_p2s_cert");
-	if (mysql_thread___ssl_p2s_key) free(mysql_thread___ssl_p2s_key);
-	mysql_thread___ssl_p2s_key=GloMTH->get_variable_string((char *)"ssl_p2s_key");
-	if (mysql_thread___ssl_p2s_cipher) free(mysql_thread___ssl_p2s_cipher);
-	mysql_thread___ssl_p2s_cipher=GloMTH->get_variable_string((char *)"ssl_p2s_cipher");
-	if (mysql_thread___ssl_p2s_crl) free(mysql_thread___ssl_p2s_crl);
-	mysql_thread___ssl_p2s_crl=GloMTH->get_variable_string((char *)"ssl_p2s_crl");
-	if (mysql_thread___ssl_p2s_crlpath) free(mysql_thread___ssl_p2s_crlpath);
-	mysql_thread___ssl_p2s_crlpath=GloMTH->get_variable_string((char *)"ssl_p2s_crlpath");
+	REFRESH_VARIABLE_CHAR(ssl_p2s_ca);
+	REFRESH_VARIABLE_CHAR(ssl_p2s_capath);
+	REFRESH_VARIABLE_CHAR(ssl_p2s_cert);
+	REFRESH_VARIABLE_CHAR(ssl_p2s_key);
+	REFRESH_VARIABLE_CHAR(ssl_p2s_cipher);
+	REFRESH_VARIABLE_CHAR(ssl_p2s_crl);
+	REFRESH_VARIABLE_CHAR(ssl_p2s_crlpath);
 
-	mysql_thread___monitor_wait_timeout=(bool)GloMTH->get_variable_int((char *)"monitor_wait_timeout");
-	mysql_thread___monitor_writer_is_also_reader=(bool)GloMTH->get_variable_int((char *)"monitor_writer_is_also_reader");
-	mysql_thread___monitor_enabled=(bool)GloMTH->get_variable_int((char *)"monitor_enabled");
-	mysql_thread___monitor_history=GloMTH->get_variable_int((char *)"monitor_history");
-	mysql_thread___monitor_connect_interval=GloMTH->get_variable_int((char *)"monitor_connect_interval");
-	mysql_thread___monitor_connect_timeout=GloMTH->get_variable_int((char *)"monitor_connect_timeout");
-	mysql_thread___monitor_ping_interval=GloMTH->get_variable_int((char *)"monitor_ping_interval");
-	mysql_thread___monitor_ping_max_failures=GloMTH->get_variable_int((char *)"monitor_ping_max_failures");
-	mysql_thread___monitor_ping_timeout=GloMTH->get_variable_int((char *)"monitor_ping_timeout");
-	mysql_thread___monitor_read_only_interval=GloMTH->get_variable_int((char *)"monitor_read_only_interval");
-	mysql_thread___monitor_read_only_timeout=GloMTH->get_variable_int((char *)"monitor_read_only_timeout");
-	mysql_thread___monitor_read_only_max_timeout_count=GloMTH->get_variable_int((char *)"monitor_read_only_max_timeout_count");
-	mysql_thread___monitor_replication_lag_interval=GloMTH->get_variable_int((char *)"monitor_replication_lag_interval");
-	mysql_thread___monitor_replication_lag_timeout=GloMTH->get_variable_int((char *)"monitor_replication_lag_timeout");
-	mysql_thread___monitor_replication_lag_count=GloMTH->get_variable_int((char *)"monitor_replication_lag_count");
-	mysql_thread___monitor_groupreplication_healthcheck_interval=GloMTH->get_variable_int((char *)"monitor_groupreplication_healthcheck_interval");
-	mysql_thread___monitor_groupreplication_healthcheck_timeout=GloMTH->get_variable_int((char *)"monitor_groupreplication_healthcheck_timeout");
-	mysql_thread___monitor_groupreplication_healthcheck_max_timeout_count=GloMTH->get_variable_int((char *)"monitor_groupreplication_healthcheck_max_timeout_count");
-	mysql_thread___monitor_groupreplication_max_transactions_behind_count=GloMTH->get_variable_int((char *)"monitor_groupreplication_max_transactions_behind_count");
-	mysql_thread___monitor_groupreplication_max_transaction_behind_for_read_only=GloMTH->get_variable_int((char *)"monitor_groupreplication_max_transactions_behind_for_read_only");
-	mysql_thread___monitor_galera_healthcheck_interval=GloMTH->get_variable_int((char *)"monitor_galera_healthcheck_interval");
-	mysql_thread___monitor_galera_healthcheck_timeout=GloMTH->get_variable_int((char *)"monitor_galera_healthcheck_timeout");
-	mysql_thread___monitor_galera_healthcheck_max_timeout_count=GloMTH->get_variable_int((char *)"monitor_galera_healthcheck_max_timeout_count");
-	mysql_thread___monitor_query_interval=GloMTH->get_variable_int((char *)"monitor_query_interval");
-	mysql_thread___monitor_query_timeout=GloMTH->get_variable_int((char *)"monitor_query_timeout");
-	mysql_thread___monitor_slave_lag_when_null=GloMTH->get_variable_int((char *)"monitor_slave_lag_when_null");
-	mysql_thread___monitor_threads_min = GloMTH->get_variable_int((char *)"monitor_threads_min");
-	mysql_thread___monitor_threads_max = GloMTH->get_variable_int((char *)"monitor_threads_max");
-	mysql_thread___monitor_threads_queue_maxsize = GloMTH->get_variable_int((char *)"monitor_threads_queue_maxsize");
+	REFRESH_VARIABLE_BOOL(monitor_wait_timeout);
+	REFRESH_VARIABLE_BOOL(monitor_writer_is_also_reader);
+	REFRESH_VARIABLE_BOOL(monitor_enabled);
+	REFRESH_VARIABLE_INT(monitor_history);
+	REFRESH_VARIABLE_INT(monitor_connect_interval);
+	REFRESH_VARIABLE_INT(monitor_connect_timeout);
+	REFRESH_VARIABLE_INT(monitor_ping_interval);
+	REFRESH_VARIABLE_INT(monitor_ping_max_failures);
+	REFRESH_VARIABLE_INT(monitor_ping_timeout);
+	REFRESH_VARIABLE_INT(monitor_aws_rds_topology_discovery_interval);
+	REFRESH_VARIABLE_INT(monitor_read_only_interval);
+	REFRESH_VARIABLE_INT(monitor_read_only_timeout);
+	REFRESH_VARIABLE_INT(monitor_read_only_max_timeout_count);
+	REFRESH_VARIABLE_BOOL(monitor_replication_lag_group_by_host);
+	REFRESH_VARIABLE_INT(monitor_replication_lag_interval);
+	REFRESH_VARIABLE_INT(monitor_replication_lag_timeout);
+	REFRESH_VARIABLE_INT(monitor_replication_lag_count);
+	REFRESH_VARIABLE_INT(monitor_groupreplication_healthcheck_interval);
+	REFRESH_VARIABLE_INT(monitor_groupreplication_healthcheck_timeout);
+	REFRESH_VARIABLE_INT(monitor_groupreplication_healthcheck_max_timeout_count);
+	REFRESH_VARIABLE_INT(monitor_groupreplication_max_transactions_behind_count);
+	REFRESH_VARIABLE_INT(monitor_groupreplication_max_transactions_behind_for_read_only);
+	REFRESH_VARIABLE_INT(monitor_galera_healthcheck_interval);
+	REFRESH_VARIABLE_INT(monitor_galera_healthcheck_timeout);
+	REFRESH_VARIABLE_INT(monitor_galera_healthcheck_max_timeout_count);
+	REFRESH_VARIABLE_INT(monitor_query_interval);
+	REFRESH_VARIABLE_INT(monitor_query_timeout);
+	REFRESH_VARIABLE_INT(monitor_slave_lag_when_null);
+	REFRESH_VARIABLE_INT(monitor_threads_min);
+	REFRESH_VARIABLE_INT(monitor_threads_max);
+	REFRESH_VARIABLE_INT(monitor_threads_queue_maxsize);
+	REFRESH_VARIABLE_INT(monitor_local_dns_cache_ttl);
+	REFRESH_VARIABLE_INT(monitor_local_dns_cache_refresh_interval);
+	REFRESH_VARIABLE_INT(monitor_local_dns_resolver_queue_maxsize);
 
-	if (mysql_thread___firewall_whitelist_errormsg) free(mysql_thread___firewall_whitelist_errormsg);
-	mysql_thread___firewall_whitelist_errormsg=GloMTH->get_variable_string((char *)"firewall_whitelist_errormsg");
-	if (mysql_thread___init_connect) free(mysql_thread___init_connect);
-	mysql_thread___init_connect=GloMTH->get_variable_string((char *)"init_connect");
-	if (mysql_thread___ldap_user_variable) free(mysql_thread___ldap_user_variable);
-	mysql_thread___ldap_user_variable=GloMTH->get_variable_string((char *)"ldap_user_variable");
-	if (mysql_thread___add_ldap_user_comment) free(mysql_thread___add_ldap_user_comment);
-	mysql_thread___add_ldap_user_comment=GloMTH->get_variable_string((char *)"add_ldap_user_comment");
-	if (mysql_thread___default_tx_isolation) free(mysql_thread___default_tx_isolation);
-	mysql_thread___default_tx_isolation=GloMTH->get_variable_string((char *)"default_tx_isolation");
-	if (mysql_thread___default_session_track_gtids) free(mysql_thread___default_session_track_gtids);
-	mysql_thread___default_session_track_gtids=GloMTH->get_variable_string((char *)"default_session_track_gtids");
+	REFRESH_VARIABLE_CHAR(firewall_whitelist_errormsg);
+	REFRESH_VARIABLE_CHAR(init_connect);
+	REFRESH_VARIABLE_CHAR(ldap_user_variable);
+	REFRESH_VARIABLE_CHAR(add_ldap_user_comment);
+	REFRESH_VARIABLE_CHAR(default_session_track_gtids);
 
 	for (int i=0; i<SQL_NAME_LAST_LOW_WM; i++) {
 		if (mysql_thread___default_variables[i]) {
@@ -3959,68 +4366,68 @@ void MySQL_Thread::refresh_variables() {
 		}
 	}
 
-	if (mysql_thread___server_version) free(mysql_thread___server_version);
-	mysql_thread___server_version=GloMTH->get_variable_string((char *)"server_version");
-	if (mysql_thread___eventslog_filename) free(mysql_thread___eventslog_filename);
-	mysql_thread___eventslog_filesize=GloMTH->get_variable_int((char *)"eventslog_filesize");
-	mysql_thread___eventslog_default_log=GloMTH->get_variable_int((char *)"eventslog_default_log");
-	mysql_thread___eventslog_format=GloMTH->get_variable_int((char *)"eventslog_format");
-	mysql_thread___eventslog_filename=GloMTH->get_variable_string((char *)"eventslog_filename");
-	if (mysql_thread___auditlog_filename) free(mysql_thread___auditlog_filename);
-	mysql_thread___auditlog_filesize=GloMTH->get_variable_int((char *)"auditlog_filesize");
-	mysql_thread___auditlog_filename=GloMTH->get_variable_string((char *)"auditlog_filename");
+	REFRESH_VARIABLE_CHAR(server_version);
+	REFRESH_VARIABLE_INT(eventslog_filesize);
+	REFRESH_VARIABLE_INT(eventslog_default_log);
+	REFRESH_VARIABLE_INT(eventslog_format);
+	REFRESH_VARIABLE_CHAR(eventslog_filename);
+	REFRESH_VARIABLE_INT(auditlog_filesize);
+	REFRESH_VARIABLE_CHAR(auditlog_filename);
 	GloMyLogger->events_set_base_filename(); // both filename and filesize are set here
 	GloMyLogger->audit_set_base_filename(); // both filename and filesize are set here
-	if (mysql_thread___default_schema) free(mysql_thread___default_schema);
-	mysql_thread___default_schema=GloMTH->get_variable_string((char *)"default_schema");
-	if (mysql_thread___keep_multiplexing_variables) free(mysql_thread___keep_multiplexing_variables);
-	mysql_thread___keep_multiplexing_variables=GloMTH->get_variable_string((char *)"keep_multiplexing_variables");
+	REFRESH_VARIABLE_CHAR(default_schema);
+	REFRESH_VARIABLE_CHAR(keep_multiplexing_variables);
+	REFRESH_VARIABLE_CHAR(default_authentication_plugin);
+	mysql_thread___default_authentication_plugin_int = GloMTH->variables.default_authentication_plugin_int;
 	mysql_thread___server_capabilities=GloMTH->get_variable_uint16((char *)"server_capabilities");
-	mysql_thread___handle_unknown_charset=GloMTH->get_variable_int((char *)"handle_unknown_charset");
-	mysql_thread___poll_timeout=GloMTH->get_variable_int((char *)"poll_timeout");
-	mysql_thread___poll_timeout_on_failure=GloMTH->get_variable_int((char *)"poll_timeout_on_failure");
-	mysql_thread___have_compress=(bool)GloMTH->get_variable_int((char *)"have_compress");
-	mysql_thread___have_ssl=(bool)GloMTH->get_variable_int((char *)"have_ssl");
-	mysql_thread___multiplexing=(bool)GloMTH->get_variable_int((char *)"multiplexing");
-	mysql_thread___log_unhealthy_connections=(bool)GloMTH->get_variable_int((char *)"log_unhealthy_connections");
-	mysql_thread___connection_warming=(bool)GloMTH->get_variable_int((char*)"connection_warming");
-	mysql_thread___enforce_autocommit_on_reads=(bool)GloMTH->get_variable_int((char *)"enforce_autocommit_on_reads");
-	mysql_thread___autocommit_false_not_reusable=(bool)GloMTH->get_variable_int((char *)"autocommit_false_not_reusable");
-	mysql_thread___autocommit_false_is_transaction=(bool)GloMTH->get_variable_int((char *)"autocommit_false_is_transaction");
-	mysql_thread___verbose_query_error=(bool)GloMTH->get_variable_int((char *)"verbose_query_error");
-	mysql_thread___commands_stats=(bool)GloMTH->get_variable_int((char *)"commands_stats");
-	mysql_thread___query_digests=(bool)GloMTH->get_variable_int((char *)"query_digests");
-	mysql_thread___query_digests_lowercase=(bool)GloMTH->get_variable_int((char *)"query_digests_lowercase");
-	mysql_thread___query_digests_replace_null=(bool)GloMTH->get_variable_int((char *)"query_digests_replace_null");
-	mysql_thread___query_digests_no_digits=(bool)GloMTH->get_variable_int((char *)"query_digests_no_digits");
-	mysql_thread___query_digests_normalize_digest_text=(bool)GloMTH->get_variable_int((char *)"query_digests_normalize_digest_text");
-	mysql_thread___query_digests_track_hostname=(bool)GloMTH->get_variable_int((char *)"query_digests_track_hostname");
-	mysql_thread___query_digests_grouping_limit=(int)GloMTH->get_variable_int((char *)"query_digests_grouping_limit");
-	mysql_thread___query_digests_groups_grouping_limit=(int)GloMTH->get_variable_int((char *)"query_digests_groups_grouping_limit");
-	mysql_thread___query_digests_keep_comment=(bool)GloMTH->get_variable_int((char *)"query_digests_keep_comment");
+	REFRESH_VARIABLE_INT(handle_unknown_charset);
+	REFRESH_VARIABLE_INT(poll_timeout);
+	REFRESH_VARIABLE_INT(poll_timeout_on_failure);
+	REFRESH_VARIABLE_BOOL(have_compress);
+	REFRESH_VARIABLE_BOOL(have_ssl);
+	REFRESH_VARIABLE_BOOL(multiplexing);
+	REFRESH_VARIABLE_BOOL(log_unhealthy_connections);
+	REFRESH_VARIABLE_BOOL(connection_warming);
+	REFRESH_VARIABLE_BOOL(enforce_autocommit_on_reads);
+	REFRESH_VARIABLE_BOOL(autocommit_false_not_reusable);
+	REFRESH_VARIABLE_BOOL(autocommit_false_is_transaction);
+	REFRESH_VARIABLE_BOOL(verbose_query_error);
+	REFRESH_VARIABLE_BOOL(commands_stats);
+	REFRESH_VARIABLE_BOOL(query_digests);
+	REFRESH_VARIABLE_BOOL(query_digests_lowercase);
+	REFRESH_VARIABLE_BOOL(query_digests_replace_null);
+	REFRESH_VARIABLE_BOOL(query_digests_no_digits);
+	REFRESH_VARIABLE_BOOL(query_digests_normalize_digest_text);
+	REFRESH_VARIABLE_BOOL(query_digests_track_hostname);
+	REFRESH_VARIABLE_INT(query_digests_grouping_limit);
+	REFRESH_VARIABLE_INT(query_digests_groups_grouping_limit);
+	REFRESH_VARIABLE_BOOL(query_digests_keep_comment);
+	REFRESH_VARIABLE_BOOL(parse_failure_logs_digest);
 	variables.min_num_servers_lantency_awareness=GloMTH->get_variable_int((char *)"min_num_servers_lantency_awareness");
 	variables.aurora_max_lag_ms_only_read_from_replicas=GloMTH->get_variable_int((char *)"aurora_max_lag_ms_only_read_from_replicas");
 	variables.stats_time_backend_query=(bool)GloMTH->get_variable_int((char *)"stats_time_backend_query");
 	variables.stats_time_query_processor=(bool)GloMTH->get_variable_int((char *)"stats_time_query_processor");
 	variables.query_cache_stores_empty_result=(bool)GloMTH->get_variable_int((char *)"query_cache_stores_empty_result");
-	mysql_thread___hostgroup_manager_verbose = GloMTH->get_variable_int((char *)"hostgroup_manager_verbose");
-	mysql_thread___kill_backend_connection_when_disconnect=(bool)GloMTH->get_variable_int((char *)"kill_backend_connection_when_disconnect");
-	mysql_thread___client_session_track_gtid=(bool)GloMTH->get_variable_int((char *)"client_session_track_gtid");
-	mysql_thread___sessions_sort=(bool)GloMTH->get_variable_int((char *)"sessions_sort");
+	REFRESH_VARIABLE_INT(hostgroup_manager_verbose);
+	REFRESH_VARIABLE_BOOL(kill_backend_connection_when_disconnect);
+	REFRESH_VARIABLE_BOOL(client_session_track_gtid);
+	REFRESH_VARIABLE_BOOL(sessions_sort);
 #ifdef IDLE_THREADS
-	mysql_thread___session_idle_show_processlist=(bool)GloMTH->get_variable_int((char *)"session_idle_show_processlist");
+	REFRESH_VARIABLE_BOOL(session_idle_show_processlist);
 #endif // IDLE_THREADS
-	mysql_thread___show_processlist_extended=GloMTH->get_variable_int((char *)"show_processlist_extended");
-	mysql_thread___servers_stats=(bool)GloMTH->get_variable_int((char *)"servers_stats");
-	mysql_thread___default_reconnect=(bool)GloMTH->get_variable_int((char *)"default_reconnect");
-	mysql_thread___enable_client_deprecate_eof=(bool)GloMTH->get_variable_int((char *)"enable_client_deprecate_eof");
-	mysql_thread___enable_server_deprecate_eof=(bool)GloMTH->get_variable_int((char *)"enable_server_deprecate_eof");
-	mysql_thread___enable_load_data_local_infile=(bool)GloMTH->get_variable_int((char *)"enable_load_data_local_infile");
-	mysql_thread___log_mysql_warnings_enabled=(bool)GloMTH->get_variable_int((char *)"log_mysql_warnings_enabled");
-	mysql_thread___client_host_cache_size=GloMTH->get_variable_int((char *)"client_host_cache_size");
-	mysql_thread___client_host_error_counts=GloMTH->get_variable_int((char *)"client_host_error_counts");
+	REFRESH_VARIABLE_INT(show_processlist_extended);
+	REFRESH_VARIABLE_BOOL(servers_stats);
+	REFRESH_VARIABLE_BOOL(default_reconnect);
+	REFRESH_VARIABLE_BOOL(enable_client_deprecate_eof);
+	REFRESH_VARIABLE_BOOL(enable_server_deprecate_eof);
+	REFRESH_VARIABLE_BOOL(enable_load_data_local_infile);
+	REFRESH_VARIABLE_BOOL(log_mysql_warnings_enabled);
+	REFRESH_VARIABLE_INT(client_host_cache_size);
+	REFRESH_VARIABLE_INT(client_host_error_counts);
+	REFRESH_VARIABLE_INT(handle_warnings);
+	REFRESH_VARIABLE_INT(evaluate_replication_lag_on_servers_load);
 #ifdef DEBUG
-	mysql_thread___session_debug=(bool)GloMTH->get_variable_int((char *)"session_debug");
+	REFRESH_VARIABLE_BOOL(session_debug);
 #endif /* DEBUG */
 	GloMTH->wrunlock();
 	pthread_mutex_unlock(&GloVars.global.ext_glomth_mutex);
@@ -4085,8 +4492,22 @@ MySQL_Thread::MySQL_Thread() {
 	for (int i=0; i<SQL_NAME_LAST_LOW_WM; i++) {
 		mysql_thread___default_variables[i] = NULL;
 	}
+	shutdown=0;
+	thr_SetParser = NULL;
 }
 
+/**
+ * @brief Registers a session with the connection handler.
+ * 
+ * This method registers a session with the connection handler of the MySQL thread. It sets the thread pointer
+ * of the session to the current MySQL thread, marks the session as being handled by the connections handler,
+ * and adds the session to the MySQL sessions list.
+ * 
+ * @param _sess Pointer to the MySQL_Session object to register.
+ * @param _new Boolean flag indicating whether the session is new.
+ * 
+ * @note This method assumes that the MySQL sessions list (mysql_sessions) has been properly initialized and is accessible.
+ */
 void MySQL_Thread::register_session_connection_handler(MySQL_Session *_sess, bool _new) {
 	_sess->thread=this;
 	_sess->connections_handler=true;
@@ -4094,6 +4515,18 @@ void MySQL_Thread::register_session_connection_handler(MySQL_Session *_sess, boo
 	mysql_sessions->add(_sess);
 }
 
+
+/**
+ * @brief Unregisters a session from the connection handler.
+ * 
+ * This method unregisters a session from the connection handler of the MySQL thread. It removes the session
+ * from the MySQL sessions list based on the provided index.
+ * 
+ * @param idx Index of the session in the MySQL sessions list to unregister.
+ * @param _new Boolean flag indicating whether the session is new.
+ * 
+ * @note This method assumes that the MySQL sessions list (mysql_sessions) has been properly initialized and is accessible.
+ */
 void MySQL_Thread::unregister_session_connection_handler(int idx, bool _new) {
 	assert(_new);
 	mysql_sessions->remove_index_fast(idx);
@@ -4511,12 +4944,50 @@ SQLite3_result * MySQL_Threads_Handler::SQL3_GlobalStatus(bool _memory) {
 			pta[1]=buf;
 			result->add_row(pta);
 		}
+		{
+			pta[0] = (char*)"MySQL_Monitor_dns_cache_queried";
+			sprintf(buf, "%llu", GloMyMon->dns_cache_queried);
+			pta[1] = buf;
+			result->add_row(pta);
+		}
+		{
+			pta[0] = (char*)"MySQL_Monitor_dns_cache_lookup_success";
+			sprintf(buf, "%llu", GloMyMon->dns_cache_lookup_success);
+			pta[1] = buf;
+			result->add_row(pta);
+		}
+		{
+			pta[0] = (char*)"MySQL_Monitor_dns_cache_record_updated";
+			sprintf(buf, "%llu", GloMyMon->dns_cache_record_updated);
+			pta[1] = buf;
+			result->add_row(pta);
+		}
 	}
 	free(pta);
 	return result;
 }
 
 
+/**
+ * @brief Retrieves memory statistics from all MySQL threads.
+ * 
+ * This function iterates through all MySQL threads, including both active worker threads and idle maintenance threads if enabled,
+ * to retrieve memory statistics using the `Get_Memory_Stats()` function for each thread.
+ * 
+ * It first determines the total number of threads to iterate based on the number of active worker threads (`num_threads`) and
+ * whether idle threads are enabled (`GloVars.global.idle_threads`). If idle threads are enabled, it doubles the count to include
+ * both active worker threads and idle maintenance threads.
+ * 
+ * For each thread, it acquires a lock on the thread mutex to safely retrieve memory statistics and then releases the lock.
+ * If any thread is found to be NULL during iteration, indicating that it is not ready, the function exits early.
+ * 
+ * @note This function assumes that the `Get_Memory_Stats()` function is implemented for MySQL_Thread objects to retrieve memory statistics.
+ * 
+ * @param num_threads Number of active worker threads.
+ * @param mysql_threads Array of active worker threads.
+ * @param mysql_threads_idles Array of idle maintenance threads.
+ * @param GloVars Struct containing global variables.
+ */
 void MySQL_Threads_Handler::Get_Memory_Stats() {
 	unsigned int i;
 	unsigned int j;
@@ -4990,7 +5461,7 @@ unsigned long long MySQL_Threads_Handler::get_status_variable(
 		double final_val = 0;
 
 		if (conv != 0) {
-			final_val = (q - (cur_val / conv)) * conv;
+			final_val = (q - (cur_val * conv)) / conv;
 		} else {
 			final_val = q - cur_val;
 		}
@@ -5020,7 +5491,7 @@ unsigned long long MySQL_Threads_Handler::get_status_variable(
 		double final_val = 0;
 
 		if (conv != 0) {
-			final_val = q / conv;
+			final_val = q / static_cast<double>(conv);
 		} else {
 			final_val = q;
 		}
@@ -5166,14 +5637,29 @@ void MySQL_Threads_Handler::p_update_metrics() {
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_enabled]->Set(this->variables.monitor_enabled);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_ping_timeout]->Set(this->variables.monitor_ping_timeout/1000.0);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_ping_max_failures]->Set(this->variables.monitor_ping_max_failures);
+	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_aws_rds_topology_discovery_interval]->Set(this->variables.monitor_aws_rds_topology_discovery_interval);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_read_only_interval]->Set(this->variables.monitor_read_only_interval/1000.0);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_read_only_timeout]->Set(this->variables.monitor_read_only_timeout/1000.0);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_writer_is_also_reader]->Set(this->variables.monitor_writer_is_also_reader);
+	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_replication_lag_group_by_host]->Set(this->variables.monitor_replication_lag_group_by_host);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_replication_lag_interval]->Set(this->variables.monitor_replication_lag_interval/1000.0);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_replication_lag_timeout]->Set(this->variables.monitor_replication_lag_timeout/1000.0);
 	this->status_variables.p_gauge_array[p_th_gauge::mysql_monitor_history]->Set(this->variables.monitor_history/1000.0);
 }
 
+/**
+ * @brief Retrieves memory statistics for the MySQL thread.
+ * 
+ * This function calculates memory statistics for the MySQL thread, including backend and frontend buffers,
+ * as well as memory usage for internal session structures.
+ * 
+ * Memory statistics are stored in the `status_variables` object, particularly in the `stvar` array.
+ * 
+ * If there are active MySQL sessions associated with the thread, additional memory statistics are computed
+ * based on session-related data structures and buffers.
+ * 
+ * @note This function assumes that the `Memory_Stats()` function is implemented for MySQL_Session objects to retrieve session memory statistics.
+ */
 void MySQL_Thread::Get_Memory_Stats() {
 	unsigned int i;
 	status_variables.stvar[st_var_mysql_backend_buffers_bytes]=0;
@@ -5199,6 +5685,21 @@ void MySQL_Thread::Get_Memory_Stats() {
 }
 
 
+/**
+ * @brief Retrieves a MySQL connection from the local cache based on specified criteria.
+ * 
+ * This function retrieves a MySQL connection from the local cache managed by the MySQL_Thread instance.
+ * It searches for a suitable connection based on the provided parameters such as host group ID, session information,
+ * GTID UUID, GTID transaction ID, and maximum lag time. If a matching connection is found, it is removed from the
+ * cache and returned to the caller.
+ * 
+ * @param _hid The host group ID to which the connection belongs.
+ * @param sess The MySQL session associated with the connection.
+ * @param gtid_uuid The GTID UUID used for replication, or NULL if not used.
+ * @param gtid_trxid The GTID transaction ID.
+ * @param max_lag_ms The maximum lag time allowed for the connection in milliseconds.
+ * @return A pointer to the retrieved MySQL connection if found; otherwise, NULL.
+ */
 MySQL_Connection * MySQL_Thread::get_MyConn_local(unsigned int _hid, MySQL_Session *sess, char *gtid_uuid, uint64_t gtid_trxid, int max_lag_ms) {
 	// some sanity check
 	if (sess == NULL) return NULL;
@@ -5258,12 +5759,26 @@ MySQL_Connection * MySQL_Thread::get_MyConn_local(unsigned int _hid, MySQL_Sessi
 	return NULL;
 }
 
+
+/**
+ * @brief Pushes a MySQL connection to the local connection pool.
+ * 
+ * This function is responsible for adding a MySQL connection to the local connection pool.
+ * It resets the insert_id and checks if the associated server is online and the connection is idle
+ * before adding it to the pool.
+ * 
+ * If the server is online and the connection is idle, the connection is added to the cached connections pool.
+ * Otherwise, if the server is not online or the connection is not idle, the connection is pushed to the
+ * global connection pool managed by MySQL_Host_Group_Manager.
+ * 
+ * @param c Pointer to the MySQL_Connection object to be pushed to the local connection pool.
+ */
 void MySQL_Thread::push_MyConn_local(MySQL_Connection *c) {
 	MySrvC *mysrvc=NULL;
 	mysrvc=(MySrvC *)c->parent;
 	// reset insert_id #1093
 	c->mysql->insert_id = 0;
-	if (mysrvc->status==MYSQL_SERVER_STATUS_ONLINE) {
+	if (mysrvc->get_status() == MYSQL_SERVER_STATUS_ONLINE) {
 		if (c->async_state_machine==ASYNC_IDLE) {
 			cached_connections->add(c);
 			return; // all went well
@@ -5272,22 +5787,37 @@ void MySQL_Thread::push_MyConn_local(MySQL_Connection *c) {
 	MyHGM->push_MyConn_to_pool(c);
 }
 
+
+/**
+ * @brief Returns all locally cached MySQL connections to the global connection pool.
+ * 
+ * This function is responsible for returning all locally cached MySQL connections to the global connection pool.
+ * It checks if there are any cached connections available, and if so, it pushes them back to the global connection pool
+ * managed by MySQL_Host_Group_Manager. After returning the connections, it clears the local cached connections pool.
+ */
 void MySQL_Thread::return_local_connections() {
 	if (cached_connections->len==0) {
 		return;
 	}
-/*
-	MySQL_Connection **ca=(MySQL_Connection **)malloc(sizeof(MySQL_Connection *)*(cached_connections->len+1));
-	unsigned int i=0;
-*/
-//	ca[i]=NULL;
 	MyHGM->push_MyConn_to_pool_array((MySQL_Connection **)cached_connections->pdata, cached_connections->len);
-//	free(ca);
 	while (cached_connections->len) {
 		cached_connections->remove_index_fast(0);
 	}
 }
 
+/**
+ * @brief Scans sessions to kill based on connection and query IDs stored in the kill queue.
+ * 
+ * This function scans sessions to kill based on the connection and query IDs stored in the kill queue.
+ * It iterates over the MySQL sessions and checks if any session matches the IDs stored in the kill queue.
+ * If a session matches, it is marked for termination.
+ * 
+ * For idle threads, it also scans sessions in the idle and resume sessions queues maintained by the session exchange.
+ * 
+ * @note This function assumes that the kill queue (kq) contains connection and query IDs to be scanned.
+ * 
+ * @see MySQL_Thread::Scan_Sessions_to_Kill
+ */
 void MySQL_Thread::Scan_Sessions_to_Kill_All() {
 	if (kq.conn_ids.size() + kq.query_ids.size()) {
 		Scan_Sessions_to_Kill(mysql_sessions);
@@ -5326,6 +5856,17 @@ void MySQL_Thread::Scan_Sessions_to_Kill_All() {
 	kq.query_ids.clear();
 }
 
+
+/**
+ * @brief Scans sessions in the provided session array to mark sessions for termination based on kill queue IDs.
+ * 
+ * This function scans sessions in the provided session array (mysess) to identify sessions that match the connection
+ * and query IDs stored in the kill queue (kq). If a session matches a connection or query ID, it is marked for termination.
+ * 
+ * @param mysess Pointer to the session array to be scanned.
+ * 
+ * @note This function assumes that the kill queue (kq) contains connection and query IDs to be scanned.
+ */
 void MySQL_Thread::Scan_Sessions_to_Kill(PtrArray *mysess) {
 			for (unsigned int n=0; n<mysess->len && ( kq.conn_ids.size() + kq.query_ids.size() ) ; n++) {
 				MySQL_Session *_sess=(MySQL_Session *)mysess->index(n);
@@ -5368,6 +5909,16 @@ void MySQL_Thread::Scan_Sessions_to_Kill(PtrArray *mysess) {
 }
 
 #ifdef IDLE_THREADS
+/**
+ * @brief Moves a session to the idle session array if it meets the idle criteria.
+ * 
+ * This function checks if a session should be moved to the idle session array based on its idle time
+ * and other conditions. If the session meets the idle criteria, it is moved to the idle session array.
+ * 
+ * @param myds Pointer to the MySQL data stream associated with the session.
+ * @param n The index of the session in the poll array.
+ * @return True if the session is moved to the idle session array, false otherwise.
+ */
 bool MySQL_Thread::move_session_to_idle_mysql_sessions(MySQL_Data_Stream *myds, unsigned int n) {
 	unsigned long long _tmp_idle = mypolls.last_recv[n] > mypolls.last_sent[n] ? mypolls.last_recv[n] : mypolls.last_sent[n] ;
 	if (_tmp_idle < ( (curtime > (unsigned int)mysql_thread___session_idle_ms * 1000) ? (curtime - mysql_thread___session_idle_ms * 1000) : 0)) {
@@ -5376,15 +5927,6 @@ bool MySQL_Thread::move_session_to_idle_mysql_sessions(MySQL_Data_Stream *myds, 
 		if (myds->sess->client_myds == myds && !myds->available_data_out() && myds->sess->pause_until <= curtime) {
 			//unsigned int j;
 			bool has_backends = myds->sess->has_any_backend();
-/*
-			for (j=0;j<myds->sess->mybes->len;j++) {
-				MySQL_Backend *tmp_mybe=(MySQL_Backend *)myds->sess->mybes->index(j);
-				MySQL_Data_Stream *__myds=tmp_mybe->server_myds;
-				if (__myds->myconn) {
-					conns++;
-				}
-			}
-*/
 			if (has_backends==false) {
 				unsigned long long idle_since = curtime - myds->sess->IdleTime();
 				mypolls.remove_index_fast(n);
@@ -5419,6 +5961,15 @@ bool MySQL_Thread::set_backend_to_be_skipped_if_frontend_is_slow(MySQL_Data_Stre
 }
 
 #ifdef IDLE_THREADS
+/**
+ * @brief Moves sessions from the idle thread's session array to the worker thread's session array.
+ * 
+ * This function is called by the idle maintenance thread to transfer sessions from the idle session array
+ * managed by the exchange structure to the worker thread's session array. It locks the mutex associated
+ * with the idle session array, iterates through the sessions, registers each session, adds it to the worker
+ * thread's poll array, and adds it to the epoll set for monitoring read events. Finally, it updates the session
+ * map to map thread IDs to the positions in the worker thread's session array.
+ */
 void MySQL_Thread::idle_thread_gets_sessions_from_worker_thread() {
 	pthread_mutex_lock(&myexchange.mutex_idles);
 	while (myexchange.idle_mysql_sessions->len) {
@@ -5478,6 +6029,14 @@ void MySQL_Thread::handle_mirror_queue_mysql_sessions() {
 	}
 }
 
+
+/**
+ * @brief Handles the kill queues by scanning sessions to kill and setting the maintenance loop flag.
+ * 
+ * This function is responsible for handling the kill queues. It locks the mutex associated with the kill queues,
+ * scans the sessions to kill if there are pending connections or queries in the kill queues, and sets the maintenance
+ * loop flag to true to initiate maintenance tasks. After processing the kill queues, it releases the mutex.
+ */
 void MySQL_Thread::handle_kill_queues() {
 	pthread_mutex_lock(&kq.m);
 	if (kq.conn_ids.size() + kq.query_ids.size()) {
@@ -5487,6 +6046,16 @@ void MySQL_Thread::handle_kill_queues() {
 	pthread_mutex_unlock(&kq.m);
 }
 
+
+/**
+ * @brief Checks for timing out session and marks them for processing.
+ * 
+ * This function checks for timing out sessions and marks them for processing. Although the logic for managing connection timeout
+ * was removed due to the addition of the MariaDB client library, this function remains as a placeholder. It checks if the session
+ * has reached its wait_until or pause_until time, and if so, marks the session for processing.
+ * 
+ * @param n The index of the session in the MySQL_Data_Stream array.
+ */
 void MySQL_Thread::check_timing_out_session(unsigned int n) {
 	// FIXME: this logic was removed completely because we added mariadb client library. Yet, we need to implement a way to manage connection timeout
 	// check for timeout
@@ -5505,6 +6074,15 @@ void MySQL_Thread::check_timing_out_session(unsigned int n) {
 	}
 }
 
+
+/**
+ * @brief Checks for an invalid file descriptor (FD) and raises an error if found.
+ * 
+ * This function checks if the file descriptor (FD) at the specified index in the `mypolls.fds` array is invalid (`POLLNVAL`).
+ * If an invalid FD is found, it raises an error and asserts to ensure that the program does not proceed with an invalid FD.
+ * 
+ * @param n The index of the file descriptor in the `mypolls.fds` array.
+ */
 void MySQL_Thread::check_for_invalid_fd(unsigned int n) {
 	// check if the FD is valid
 	if (mypolls.fds[n].revents==POLLNVAL) {
@@ -5546,7 +6124,7 @@ void MySQL_Thread::tune_timeout_for_myds_needs_pause(MySQL_Data_Stream *myds) {
 	if (myds->wait_until > curtime) {
 		if (mypolls.poll_timeout==0 || (myds->wait_until - curtime < mypolls.poll_timeout) ) {
 			mypolls.poll_timeout= myds->wait_until - curtime;
-			proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 7, "Session=%p , poll_timeout=%llu , wait_until=%llu , curtime=%llu\n", mypolls.poll_timeout, myds->wait_until, curtime);
+			proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 7, "Session=%p , poll_timeout=%u , wait_until=%llu , curtime=%llu\n", myds->sess, mypolls.poll_timeout, myds->wait_until, curtime);
 		}
 	}
 }
@@ -5554,7 +6132,7 @@ void MySQL_Thread::tune_timeout_for_myds_needs_pause(MySQL_Data_Stream *myds) {
 void MySQL_Thread::tune_timeout_for_session_needs_pause(MySQL_Data_Stream *myds) {
 	if (mypolls.poll_timeout==0 || (myds->sess->pause_until - curtime < mypolls.poll_timeout) ) {
 		mypolls.poll_timeout= myds->sess->pause_until - curtime;
-		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 7, "Session=%p , poll_timeout=%llu , pause_until=%llu , curtime=%llu\n", mypolls.poll_timeout, myds->sess->pause_until, curtime);
+		proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 7, "Session=%p , poll_timeout=%u , pause_until=%llu , curtime=%llu\n", myds->sess, mypolls.poll_timeout, myds->sess->pause_until, curtime);
 	}
 }
 

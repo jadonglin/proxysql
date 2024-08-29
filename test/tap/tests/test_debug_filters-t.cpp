@@ -17,7 +17,7 @@
 #include <unistd.h>
 #include <vector>
 
-#include <mysql.h>
+#include "mysql.h"
 
 #include "tap.h"
 #include "command_line.h"
@@ -51,30 +51,6 @@ int set_statement_query(const CommandLine& cl) {
 
 	MYSQL_QUERY(proxysql_mysql, "SET character_set_results='utf8'");
 	mysql_close(proxysql_mysql);
-
-	return EXIT_SUCCESS;
-}
-
-string get_env(const string& var) {
-	string f_path {};
-
-	char* p_infra_datadir = std::getenv("REGULAR_INFRA_DATADIR");
-	if (p_infra_datadir != nullptr) {
-		f_path = p_infra_datadir;
-	}
-
-	return f_path;
-}
-
-int open_file_and_seek_end(const string& f_path, fstream& f_proxysql_log) {
-	f_proxysql_log.open(f_path.c_str(), fstream::in | fstream::out);
-
-	if (!f_proxysql_log.is_open() || !f_proxysql_log.good()) {
-		diag("Failed to open 'proxysql.log' file: { path: %s, error: %d }", f_path.c_str(), errno);
-		return EXIT_FAILURE;
-	}
-
-	f_proxysql_log.seekg(0, std::ios::end);
 
 	return EXIT_SUCCESS;
 }
@@ -161,6 +137,11 @@ int main(int argc, char** argv) {
 		diag("Failed to get the required environmental variables.");
 		return EXIT_FAILURE;
 	}
+
+	diag("This test is now disabled because the plan is to have debugging always enabled");
+	plan(1);
+	ok(1,"This test is now disabled because the plan is to have debugging always enabled");
+	return exit_status();
 
 	const auto create_conn_action = [&cl]() -> int { return create_and_close_proxy_conn(cl); };
 	const auto set_statement_action = [&cl]() -> int { return set_statement_query(cl); };

@@ -5,8 +5,10 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
-#include <openssl/ssl.h>
 
+#include "openssl/ssl.h"
+
+#include "mysql.h"
 #include "proxysql_structs.h"
 #include "sqlite3db.h"
 #include "MySQL_LDAP_Authentication.hpp"

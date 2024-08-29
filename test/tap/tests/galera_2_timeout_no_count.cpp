@@ -23,7 +23,6 @@
 #include <resolv.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include "SpookyV2.h"
 
 #include <fcntl.h>
 #include <sys/utsname.h>
@@ -53,25 +52,6 @@ extern MySQL_HostGroups_Manager *MyHGM;
 
 static bool init_tap=false;
 static std::vector<int> timeouts;
-
-#define SAFE_SQLITE3_STEP(_stmt) do {\
-  do {\
-    rc=sqlite3_step(_stmt);\
-    if (rc!=SQLITE_DONE) {\
-      assert(rc==SQLITE_LOCKED);\
-      usleep(100);\
-    }\
-  } while (rc!=SQLITE_DONE);\
-} while (0)
-
-#define SAFE_SQLITE3_STEP2(_stmt) do {\
-        do {\
-                rc=sqlite3_step(_stmt);\
-                if (rc==SQLITE_LOCKED || rc==SQLITE_BUSY) {\
-                        usleep(100);\
-                }\
-        } while (rc==SQLITE_LOCKED || rc==SQLITE_BUSY);\
-} while (0)
 
 void SQLite3_Server::init_galera_ifaces_string(std::string& s) {
 	if(!s.empty())
@@ -266,7 +246,7 @@ void SQLite3_Server_session_handler(MySQL_Session *sess, void *_pa, PtrSize_t *p
 				}
 				delete rs1;
 
-				std::unique_ptr<SQLite3_result> rs = std::unique_ptr<SQLite3_result>(MyHGM->dump_table_mysql_servers());
+				std::unique_ptr<SQLite3_result> rs = std::unique_ptr<SQLite3_result>(MyHGM->dump_table_mysql("mysql_servers"));
 				for (auto r : rs->rows) {
 					if (r->fields[0] && r->fields[1] && !strcmp(r->fields[1], "127.1.1.11") && strcmp(r->fields[0],"2274")) {
 						ok(true, "Host stays online. Max timeouts count [%d], number of timeouts in a row [%d], generated timeouts [%d]", max_timeouts, actual_timeouts, num_timeouts);

@@ -1,3 +1,8 @@
+[![CI-selftests](https://github.com/sysown/proxysql/actions/workflows/CI-selftests.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/CI-selftests.yml)
+[![CI-repltests](https://github.com/sysown/proxysql/actions/workflows/CI-repltests.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/CI-repltests.yml)
+[![CodeQL](https://github.com/sysown/proxysql/actions/workflows/CI-codeql.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/CI-codeql.yml)
+[![Package-Build](https://github.com/sysown/proxysql/actions/workflows/CI-package-build.yml/badge.svg)](https://github.com/sysown/proxysql/actions/workflows/-CI-package-build.yml)
+
 <a><img src="https://i0.wp.com/proxysql.com/wp-content/uploads/2020/04/ProxySQL-Colour-Logo.png?fit=800%2C278&ssl=1" alt="ProxySQL"></a>
 
 Introduction	
@@ -29,8 +34,8 @@ Released packages can be found here: https://github.com/sysown/proxysql/releases
 
 Just download a package and use your systems package manager to install it:
 ```bash
-wget https://github.com/sysown/proxysql/releases/download/v2.1.0/proxysql_2.1.0-ubuntu20_amd64.deb
-dpkg -i proxysql_2.1.0-ubuntu20_amd64.deb
+wget https://github.com/sysown/proxysql/releases/download/v2.4.2/proxysql_2.4.2-ubuntu20_amd64.deb
+dpkg -i proxysql_2.4.2-ubuntu20_amd64.deb
 ```
 
 Alternatively you can also use the available repositories:
@@ -39,10 +44,9 @@ Alternatively you can also use the available repositories:
 
 Adding repository:
 ```bash
-apt-get install -y lsb-release apt-transport-https
-wget -O - 'https://repo.proxysql.com/ProxySQL/repo_pub_key' | apt-key add -
-echo deb https://repo.proxysql.com/ProxySQL/proxysql-2.1.x/$(lsb_release -sc)/ ./ \
-| tee /etc/apt/sources.list.d/proxysql.list
+apt-get update && apt-get install -y --no-install-recommends lsb-release wget apt-transport-https ca-certificates
+wget -nv -O /etc/apt/trusted.gpg.d/proxysql-2.4.x-keyring.gpg 'https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/repo_pub_key.gpg'
+echo "deb https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/$(lsb_release -sc)/ ./" | tee /etc/apt/sources.list.d/proxysql.list
 ```
 
 Installing:
@@ -55,12 +59,12 @@ apt-get install proxysql OR apt-get install proxysql=version
 
 Adding repository:
 ```bash
-cat <<EOF | tee /etc/yum.repos.d/proxysql.repo
-[proxysql_repo]
-name= ProxySQL YUM repository
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.1.x/centos/\$releasever
+cat > /etc/yum.repos.d/proxysql.repo << EOF
+[proxysql]
+name=ProxySQL YUM repository
+baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/centos/\$releasever
 gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/repo_pub_key
+gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/repo_pub_key
 EOF
 ```
 
@@ -69,21 +73,75 @@ Installing:
 yum install proxysql OR yum install proxysql-version
 ```
 
-#### Amazon Linux Servers (AMI):
+#### Amazon Linux:
 
 Adding repository:
 ```bash
-vi /etc/yum.repos.d/proxysql.repo
-[proxysql_repo]
-name= ProxySQL YUM repository
-baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.1.x/centos/latest
+cat > /etc/yum.repos.d/proxysql.repo << EOF
+[proxysql]
+name=ProxySQL YUM repository
+baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/centos/8
 gpgcheck=1
-gpgkey=https://repo.proxysql.com/ProxySQL/repo_pub_key
+gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/repo_pub_key
+EOF
 ```
 
 Installing:
 ```bash
 yum install proxysql OR yum install proxysql-version
+```
+
+#### Almalinux:
+
+Adding repository:
+```bash
+cat > /etc/yum.repos.d/proxysql.repo << EOF
+[proxysql]
+name=ProxySQL YUM repository
+baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/almalinux/\$releasever
+gpgcheck=1
+gpgkey=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/repo_pub_key
+EOF
+```
+
+Installing:
+```bash
+yum install proxysql OR yum install proxysql-version
+```
+
+#### OpenSUSE:
+
+Adding repository:
+```bash
+cat > /etc/zypp/repos.d/proxysql.repo << EOF
+[proxysql]
+name=ProxySQL Zypper repository
+enabled=1
+autorefresh=0
+baseurl=https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/opensuse/\$releasever_major
+gpgcheck=1
+EOF
+```
+or
+```bash
+zypper addrepo -g -n 'ProxySQL Zypper repository' 'https://repo.proxysql.com/ProxySQL/proxysql-2.4.x/opensuse/$releasever_major' proxysql
+```
+
+Installing:
+```bash
+yum install proxysql OR yum install proxysql-version
+```
+
+#### FreeBSD:
+
+Installing (via pkg):
+```bash
+pkg install proxysql
+```
+
+Installing (via ports):
+```bash
+cd /usr/ports/databases/proxysql/ && make install clean
 ```
 
 ### Service management

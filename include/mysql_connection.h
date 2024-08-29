@@ -7,7 +7,7 @@
 #include "../deps/json/json.hpp"
 using json = nlohmann::json;
 
-#define STATUS_MYSQL_CONNECTION_TRANSACTION          0x00000001
+//#define STATUS_MYSQL_CONNECTION_TRANSACTION          0x00000001 // DEPRECATED
 #define STATUS_MYSQL_CONNECTION_COMPRESSION          0x00000002
 #define STATUS_MYSQL_CONNECTION_USER_VARIABLE        0x00000004
 #define STATUS_MYSQL_CONNECTION_PREPARED_STATEMENT   0x00000008
@@ -17,13 +17,16 @@ using json = nlohmann::json;
 #define STATUS_MYSQL_CONNECTION_NO_MULTIPLEX         0x00000080
 #define STATUS_MYSQL_CONNECTION_SQL_LOG_BIN0         0x00000100
 #define STATUS_MYSQL_CONNECTION_FOUND_ROWS           0x00000200
-#define STATUS_MYSQL_CONNECTION_NO_BACKSLASH_ESCAPES 0x00000400
+#define STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG      0x00000400
 #define STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT        0x00000800
+#define STATUS_MYSQL_CONNECTION_HAS_WARNINGS         0x00001000
+
+class MySQLServers_SslParams;
 
 class Variable {
 public:
 	char *value = (char*)"";
-	void fill_server_internal_session(json &j, int conn_num, int idx);
+	void fill_server_internal_session(json &j, int idx);
 	void fill_client_internal_session(json &j, int idx);
 };
 
@@ -53,8 +56,19 @@ class MySQL_Connection_userinfo {
 
 class MySQL_Connection {
 	private:
+	void update_warning_count_from_connection();
+	void update_warning_count_from_statement();
 	bool is_expired(unsigned long long timeout);
 	unsigned long long inserted_into_pool;
+	void connect_start_SetAttributes();
+	void connect_start_SetCharset();
+	void connect_start_SetClientFlag(unsigned long&);
+	char * connect_start_DNS_lookup();
+	void connect_start_SetSslSettings();
+	void ProcessQueryAndSetStatusFlags_Warnings(char *);
+	void ProcessQueryAndSetStatusFlags_UserVariables(char *, int);
+	void ProcessQueryAndSetStatusFlags_Savepoint(char *);
+	void ProcessQueryAndSetStatusFlags_SetBackslashEscapes();
 	public:
 	struct {
 		char *server_version;
@@ -80,7 +94,7 @@ class MySQL_Connection {
 	uint32_t var_hash[SQL_NAME_LAST_HIGH_WM];
 	// for now we store possibly missing variables in the lower range
 	// we may need to fix that, but this will cost performance
-	bool var_absent[SQL_NAME_LAST_LOW_WM] = {false};
+	bool var_absent[SQL_NAME_LAST_HIGH_WM] = {false};
 
 	std::vector<uint32_t> dynamic_variables_idx;
 	unsigned int reorder_dynamic_variables_idx();
@@ -108,6 +122,11 @@ class MySQL_Connection {
 	MySrvC *parent;
 	MySQL_Connection_userinfo *userinfo;
 	MySQL_Data_Stream *myds;
+
+	struct {
+		char* hostname;
+		char* ip;
+	} connected_host_details;
 	/**
 	 * @brief Keeps tracks of the 'server_status'. Do not confuse with the 'server_status' from the
 	 *  'MYSQL' connection itself. This flag keeps track of the configured server status from the
@@ -123,6 +142,7 @@ class MySQL_Connection {
 	} statuses;
 
 	unsigned long largest_query_length;
+	unsigned int warning_count;
 	/**
 	 * @brief This represents the internal knowledge of ProxySQL about the connection. It keeps track of those
 	 *  states which *are not reflected* into 'server_status', but are relevant for connection handling.
@@ -142,6 +162,9 @@ class MySQL_Connection {
 	bool unknown_transaction_status;
 	void compute_unknown_transaction_status();
 	char gtid_uuid[128];
+
+	MySQLServers_SslParams * ssl_params = NULL;
+
 	MySQL_Connection();
 	~MySQL_Connection();
 	bool set_autocommit(bool);
@@ -204,19 +227,25 @@ class MySQL_Connection {
 	void process_rows_in_ASYNC_STMT_EXECUTE_STORE_RESULT_CONT(unsigned long long& processed_bytes);
 
 	void async_free_result();
-	bool IsActiveTransaction(); /* {
-		bool ret=false;
-			if (mysql) {
-				ret = (mysql->server_status & SERVER_STATUS_IN_TRANS);
-				if (ret == false && (mysql)->net.last_errno) {
-					ret = true;
-				}
-			}
-		return ret;
-	} */
+	/**
+	 * @brief Returns if the connection is **for sure**, known to be in an active transaction.
+	 * @details The function considers two things:
+	 *   1. If 'server_status' is flagged with 'SERVER_STATUS_IN_TRANS'.
+	 *   2. If the connection has 'autcommit=0' and 'autocommit_false_is_transaction' is set.
+	 * @return True if the connection is known to be in a transaction, or equivalent state.
+	 */
+	bool IsKnownActiveTransaction();
+	/**
+	 * @brief Returns if the connection is in a **potential transaction**.
+	 * @details This function is a more strict version of 'IsKnownActiveTransaction', which also considers
+	 *  connections which holds 'unknown_transaction_status' as potentially active transactions.
+	 * @return True if the connection is in potentially in an active transaction.
+	 */
+	bool IsActiveTransaction();
 	bool IsServerOffline();
 	bool IsAutoCommit();
-	bool MultiplexDisabled();
+	bool AutocommitFalse_AndSavepoint();
+	bool MultiplexDisabled(bool check_delay_token = true);
 	bool IsKeepMultiplexEnabledVariables(char *query_digest_text);
 	void ProcessQueryAndSetStatusFlags(char *query_digest_text);
 	void optimize();
@@ -233,5 +262,9 @@ class MySQL_Connection {
 	bool requires_CHANGE_USER(const MySQL_Connection *client_conn);
 	unsigned int number_of_matching_session_variables(const MySQL_Connection *client_conn, unsigned int& not_matching);
 	unsigned long get_mysql_thread_id() { return mysql ? mysql->thread_id : 0; }
+	static void set_ssl_params(MYSQL *mysql, MySQLServers_SslParams *ssl_params);
+
+	void get_mysql_info_json(json&);
+	void get_backend_conn_info_json(json&);
 };
 #endif /* __CLASS_MYSQL_CONNECTION_H */

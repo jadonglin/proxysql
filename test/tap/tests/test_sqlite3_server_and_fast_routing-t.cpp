@@ -7,8 +7,8 @@
 #include <stdlib.h>
 #include <unistd.h>
 
-#include <mysql.h>
-#include <mysql/mysqld_error.h>
+#include "mysql.h"
+#include "mysqld_error.h"
 
 #include "tap.h"
 #include "command_line.h"
@@ -18,7 +18,11 @@ using query_spec = std::tuple<std::string, int>;
 
 const int sqlite3_port = 0;
 
-#include "sqlite_3_server_test.h"
+// because the test itself is a benchmark that uses a lot of TCP ports,
+// we leave some time to the OS to free resources
+const int ST = 5;
+
+#include "modules_server_test.h"
 
 inline unsigned long long monotonic_time() {
   struct timespec ts;
@@ -26,45 +30,17 @@ inline unsigned long long monotonic_time() {
   return (((unsigned long long) ts.tv_sec) * 1000000) + (ts.tv_nsec / 1000);
 }
 
-
-int main(int argc, char** argv) {
-	CommandLine cl;
-
+int benchmark_query_rules_fast_routing(CommandLine& cl, MYSQL* proxysql_admin, MYSQL* proxysql_mysql) {
 	std::string s;
-	MYSQL * proxysql_mysql = mysql_init(NULL);
 	std::pair<std::string, int> host_port {};
-	int host_port_err; 
-
-	MYSQL* proxysql_admin = mysql_init(NULL);
 
 	double nofr = 0;
 	double fr = 0;
 
-	plan(1);
-	if (cl.getEnv()) {
-		diag("Failed to get the required environmental variables.");
-		goto cleanup;
-	}
-
-	// Connect to ProxySQL Admin and check current SQLite3 configuration
-	if (
-		!mysql_real_connect(
-			proxysql_admin, cl.host, cl.admin_username, cl.admin_password,
-			NULL, cl.admin_port, NULL, 0
-		)
-	) {
-		fprintf(
-			stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__,
-			mysql_error(proxysql_admin)
-		);
-		goto cleanup;
-	}
-
-//	{
-	host_port_err = extract_sqlite3_host_port(proxysql_admin, host_port); 
+	int host_port_err = extract_module_host_port(proxysql_admin, "sqliteserver-mysql_ifaces", host_port);
 	if (host_port_err) {
 		diag("Failed to get and parse 'sqliteserver-mysql_ifaces' at line '%d'", __LINE__);
-		goto cleanup;
+		return EXIT_FAILURE;
 	}
 	s = "DELETE FROM mysql_servers WHERE hostgroup_id BETWEEN 1001 AND 3000";
 	diag("Executing: %s", s.c_str());
@@ -103,7 +79,7 @@ int main(int argc, char** argv) {
 			stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__,
 			mysql_error(proxysql_mysql)
 		);
-		goto cleanup;
+		return EXIT_FAILURE;
 	}
 	{
 		unsigned long long begin;
@@ -114,14 +90,15 @@ int main(int argc, char** argv) {
 			rc = mysql_query(proxysql_mysql, "SELECT 1");
 			if (rc != 0) {
 				fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(proxysql_mysql));
-				goto cleanup;
+				return EXIT_FAILURE;
 			}
 			MYSQL_RES* result = mysql_store_result(proxysql_mysql);
 			mysql_free_result(result);
 		}
 		unsigned long long end = monotonic_time();
 		nofr += (end - begin);
-		std::cerr << double( end - begin ) / 1000 << " millisecs.\n" ;
+		double p = double( end - begin ) / 1000; diag("Completed in %f millisecs", p);
+		unsigned long long pause = ((end-begin)/1000/1000 + 1)*2 + ST ; diag("Sleeping %llu seconds at line %d", pause, __LINE__); sleep(pause);
 	}
 
 	s = "DELETE FROM mysql_query_rules";
@@ -143,13 +120,14 @@ int main(int argc, char** argv) {
 			rc = mysql_query(proxysql_mysql, "SELECT 1");
 			if (rc != 0) {
 				fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(proxysql_mysql));
-				goto cleanup;
+				return EXIT_FAILURE;
 			}
 			MYSQL_RES* result = mysql_store_result(proxysql_mysql);
 			mysql_free_result(result);
 		}
 		unsigned long long end = monotonic_time();
-		std::cerr << double( end - begin ) / 1000 << " millisecs.\n" ;
+		double p = double( end - begin ) / 1000; diag("Completed in %f millisecs", p);
+		unsigned long long pause = ((end-begin)/1000/1000 + 1)*2 + ST ; diag("Sleeping %llu seconds at line %d", pause, __LINE__); sleep(pause);
 		nofr += (end - begin);
 	}
 
@@ -175,20 +153,21 @@ int main(int argc, char** argv) {
 			rc = mysql_query(proxysql_mysql, "SELECT 1");
 			if (rc != 0) {
 				fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(proxysql_mysql));
-				goto cleanup;
+				return EXIT_FAILURE;
 			}
 			MYSQL_RES* result = mysql_store_result(proxysql_mysql);
 			mysql_free_result(result);
 			rc = mysql_query(proxysql_mysql, "SELECT 2");
 			if (rc != 0) {
 				fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(proxysql_mysql));
-				goto cleanup;
+				return EXIT_FAILURE;
 			}
 			result = mysql_store_result(proxysql_mysql);
 			mysql_free_result(result);
 		}
 		unsigned long long end = monotonic_time();
-		std::cerr << double( end - begin ) / 1000 << " millisecs.\n" ;
+		double p = double( end - begin ) / 1000; diag("Completed in %f millisecs", p);
+		unsigned long long pause = ((end-begin)/1000/1000 + 1)*2 + ST ; diag("Sleeping %llu seconds at line %d", pause, __LINE__); sleep(pause);
 		fr += (end - begin);
 	}
 	s = "DELETE FROM mysql_query_rules";
@@ -212,23 +191,72 @@ int main(int argc, char** argv) {
 			rc = mysql_query(proxysql_mysql, "SELECT 1");
 			if (rc != 0) {
 				fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(proxysql_mysql));
-				goto cleanup;
+				return EXIT_FAILURE;
 			}
 			MYSQL_RES* result = mysql_store_result(proxysql_mysql);
 			mysql_free_result(result);
 			rc = mysql_query(proxysql_mysql, "SELECT 2");
 			if (rc != 0) {
 				fprintf(stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__, mysql_error(proxysql_mysql));
-				goto cleanup;
+				return EXIT_FAILURE;
 			}
 			result = mysql_store_result(proxysql_mysql);
 			mysql_free_result(result);
 		}
 		unsigned long long end = monotonic_time();
-		std::cerr << double( end - begin ) / 1000 << " millisecs.\n" ;
+		double p = double( end - begin ) / 1000; diag("Completed in %f millisecs", p);
+		unsigned long long pause = ((end-begin)/1000/1000 + 1)*2 + ST ; diag("Sleeping %llu seconds at line %d", pause, __LINE__); sleep(pause);
 		fr += (end - begin);
 	}
 	ok (fr < (nofr * 3) , "Times for: Single HG = %dms , multi HG = %dms", (int)(nofr/1000), (int)(fr/1000));
+
+	return EXIT_SUCCESS;
+}
+
+int main(int argc, char** argv) {
+	CommandLine cl;
+
+	MYSQL * proxysql_mysql = mysql_init(NULL);
+	MYSQL* proxysql_admin = mysql_init(NULL);
+
+	diag("This TAP test has several sleep() to give enough time to release TCP ports");
+
+	plan(2);
+	if (cl.getEnv()) {
+		diag("Failed to get the required environmental variables.");
+		goto cleanup;
+	}
+
+	// Connect to ProxySQL Admin and check current SQLite3 configuration
+	if (
+		!mysql_real_connect(
+			proxysql_admin, cl.host, cl.admin_username, cl.admin_password,
+			NULL, cl.admin_port, NULL, 0
+		)
+	) {
+		fprintf(
+			stderr, "File %s, line %d, Error: %s\n", __FILE__, __LINE__,
+			mysql_error(proxysql_admin)
+		);
+		goto cleanup;
+	}
+
+	MYSQL_QUERY(proxysql_admin, "SET mysql-query_rules_fast_routing_algorithm=1");
+	MYSQL_QUERY(proxysql_admin, "LOAD MYSQL QUERY RULES TO RUNTIME");
+
+	diag("Sleeping %d seconds at line %d", ST, __LINE__);
+	benchmark_query_rules_fast_routing(cl, proxysql_admin, proxysql_mysql);
+	diag("Sleeping %d seconds at line %d", ST, __LINE__);
+
+	MYSQL_QUERY(proxysql_admin, "SET mysql-query_rules_fast_routing_algorithm=2");
+	MYSQL_QUERY(proxysql_admin, "LOAD MYSQL QUERY RULES TO RUNTIME");
+
+	mysql_close(proxysql_mysql);
+	proxysql_mysql = mysql_init(NULL);
+
+	benchmark_query_rules_fast_routing(cl, proxysql_admin, proxysql_mysql);
+	diag("Sleeping %d seconds at line %d", ST, __LINE__);
+
 cleanup:
 
 	mysql_close(proxysql_admin);

@@ -38,11 +38,11 @@
 #include <signal.h>
 #include <errno.h>
 #include <ctype.h>
-#include <openssl/bio.h>
-#include <openssl/sha.h>
-#include <openssl/md5.h>
-#include <openssl/ssl.h>
-#include <openssl/err.h>
+#include "openssl/bio.h"
+#include "openssl/sha.h"
+#include "openssl/md5.h"
+#include "openssl/ssl.h"
+#include "openssl/err.h"
 #include <poll.h>
 #include <execinfo.h>
 
@@ -58,8 +58,17 @@
 #include "proxysql_structs.h"
 #include "proxysql_debug.h"
 #include "proxysql_macros.h"
-
+#include "proxysql_coredump.h"
+#include "proxysql_sslkeylog.h"
 #include "jemalloc.h"
+
+#ifndef NOJEM
+#if defined(__APPLE__) && defined(__MACH__)
+#ifndef mallctl
+#define mallctl(a, b, c, d, e) je_mallctl(a, b, c, d, e)
+#endif
+#endif // __APPLE__ and __MACH__
+#endif // NOJEM
 
 #ifdef DEBUG
 //#define VALGRIND_ENABLE_ERROR_REPORTING
@@ -100,13 +109,19 @@ int pkt_end(unsigned char *, unsigned int);
 int pkt_com_query(unsigned char *, unsigned int);
 enum MySQL_response_type mysql_response(unsigned char *, unsigned int);
 
-void proxy_error_func(const char *, ...);
+__attribute__((__format__ (__printf__, 2, 3)))
+void proxy_error_func(int errcode, const char *, ...);
 void print_backtrace(void);
 void proxy_info_(const char* msg, ...);
 
 #ifdef DEBUG
 void init_debug_struct();
 void init_debug_struct_from_cmdline();
+/**
+ * @brief Add a debug entry in the error log. To be used through 'proxy_debug' macro.
+ * @details This function saves/restores the previous 'errno' value.
+ */
+__attribute__((__format__ (__printf__, 7, 8)))
 void proxy_debug_func(enum debug_module, int, int, const char *, int, const char *, const char *, ...);
 void proxy_debug_get_filters(std::set<std::string>&);
 void proxy_debug_load_filters(std::set<std::string>&);

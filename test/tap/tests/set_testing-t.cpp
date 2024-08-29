@@ -11,7 +11,7 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <stdio.h>
-#include <mysql.h>
+#include "mysql.h"
 #include <string.h>
 #include <string>
 #include <time.h>
@@ -175,6 +175,13 @@ void * my_conn_thread(void *arg) {
 			else if (el.key() == "transaction_read_only") {
 				if (is_mariadb) {
 					vars["tx_read_only"] = el.value();
+				} else {
+					vars[el.key()] = el.value();
+				}
+			}
+			else if (el.key() == "max_execution_time") {
+				if (is_mariadb) {
+					vars["max_statement_time"] = el.value();
 				} else {
 					vars[el.key()] = el.value();
 				}

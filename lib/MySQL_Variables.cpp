@@ -3,9 +3,13 @@
 
 #include "MySQL_Session.h"
 #include "MySQL_Data_Stream.h"
+#ifndef SPOOKYV2
 #include "SpookyV2.h"
+#define SPOOKYV2
+#endif
 
 #include <sstream>
+#include "mysqld_error.h"
 
 
 static inline char is_digit(char c) {
@@ -14,6 +18,24 @@ static inline char is_digit(char c) {
 	return 0;
 }
 
+var_track_err_st perm_track_errs[] {
+	// ERROR 1210 (HY000): Variable not supported in combination with Galera:
+	// - Changed by MySQL, previously 'ER_UNKNOWN_SYSTEM_VARIABLE'
+	{ ER_WRONG_ARGUMENTS, "sql_generate_invisible_primary_key" }
+};
+
+bool is_perm_track_err(int err, const char* varname) {
+	const size_t count = sizeof(perm_track_errs) / sizeof(var_track_err_st);
+
+	for (size_t i = 0; i < count; i++) {
+		if (perm_track_errs[i].err == err && (strcasecmp(varname, perm_track_errs[i].name) == 0)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+#include "proxysql_find_charset.h"
 
 verify_var MySQL_Variables::verifiers[SQL_NAME_LAST_HIGH_WM];
 update_var MySQL_Variables::updaters[SQL_NAME_LAST_HIGH_WM];
@@ -76,26 +98,6 @@ MySQL_Variables::MySQL_Variables() {
 
 MySQL_Variables::~MySQL_Variables() {}
 
-bool MySQL_Variables::on_connect_to_backend(MySQL_Connection *myconn) {
-	assert(myconn);
-	auto be_version = myconn->mysql->server_version;
-
-/*
-	// completely remove this part, see suggestion in issue #3723
-	// because in MySQL_Session::handler_again___status_SETTING_GENERIC_VARIABLE()
-	// we handle error 1193 (variable is not found), this optimization here seems
-	// unnecessary, especially because the assumption used here is wrong
-	// verify this is not galera cluster
-	// assume galera cluster has two dashes in a version
-	char* first_dash = strstr(be_version, "-");
-	if (!first_dash || !strstr(first_dash+1, "-")) {
-		myconn->var_absent[SQL_WSREP_SYNC_WAIT] = true;
-	}
-*/
-	return true;
-}
-
-
 bool MySQL_Variables::client_set_hash_and_value(MySQL_Session* session, int idx, const std::string& value, uint32_t hash) {
 	if (!session || !session->client_myds || !session->client_myds->myconn) {
 		proxy_warning("Session validation failed\n");
@@ -111,6 +113,24 @@ bool MySQL_Variables::client_set_hash_and_value(MySQL_Session* session, int idx,
 	return true;
 }
 
+void MySQL_Variables::client_reset_value(MySQL_Session* session, int idx) {
+	if (!session || !session->client_myds || !session->client_myds->myconn) {
+		proxy_warning("Session validation failed\n");
+		return;
+	}
+
+	MySQL_Connection *client_conn = session->client_myds->myconn;
+
+	if (client_conn->var_hash[idx] != 0) {
+		client_conn->var_hash[idx] = 0;
+		if (client_conn->variables[idx].value) {
+			free(client_conn->variables[idx].value);
+			client_conn->variables[idx].value = NULL;
+		}
+		// we now regererate dynamic_variables_idx
+		client_conn->reorder_dynamic_variables_idx();
+	}
+}
 void MySQL_Variables::server_set_hash_and_value(MySQL_Session* session, int idx, const char* value, uint32_t hash) {
 	if (!session || !session->mybe || !session->mybe->server_myds || !session->mybe->server_myds->myconn || !value) {
 		proxy_warning("Session validation failed\n");
@@ -237,6 +257,25 @@ void MySQL_Variables::server_set_value(MySQL_Session* session, int idx, const ch
 	session->mybe->server_myds->myconn->variables[idx].value = strdup(value);
 	// we now regererate dynamic_variables_idx
 	session->mybe->server_myds->myconn->reorder_dynamic_variables_idx();
+}
+
+void MySQL_Variables::server_reset_value(MySQL_Session* session, int idx) {
+	assert(session);
+	assert(session->mybe);
+	assert(session->mybe->server_myds);
+	assert(session->mybe->server_myds->myconn);
+
+	MySQL_Connection *backend_conn = session->mybe->server_myds->myconn;
+	
+	if (backend_conn->var_hash[idx] != 0) {
+		backend_conn->var_hash[idx] = 0;
+		if (backend_conn->variables[idx].value) {
+			free(backend_conn->variables[idx].value);
+			backend_conn->variables[idx].value = NULL;
+		}
+		// we now regererate dynamic_variables_idx
+		backend_conn->reorder_dynamic_variables_idx();
+	}
 }
 
 const char* MySQL_Variables::server_get_value(MySQL_Session* session, int idx) const {

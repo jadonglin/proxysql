@@ -20,7 +20,6 @@
 
 #include "tap.h"
 
-//#include "my_global.h"
 typedef char my_bool;
 
 #include <stdlib.h>
@@ -28,6 +27,12 @@ typedef char my_bool;
 #include <stdio.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
+#include <unistd.h>
+
+#include <sys/time.h>
+
+using std::size_t;
 
 static ulong start_timer(void);
 static void end_timer(ulong start_time,char *buff);
@@ -68,6 +73,34 @@ static TEST_DATA g_test = { NO_PLAN, 0, 0, "" };
 #define tapout stdout
 
 /**
+  @brief Writes current time ("%Y-%m-%d %H:%M:%S") in the supplied buffer.
+
+  @param tm_buf Buffer to be written.
+  @param us True for enabling microseconds in log output.
+  @param len Buffer len.
+ */
+size_t get_fmt_time(char* tm_buf, size_t len, bool us=false) {
+  time_t __timer;
+  time(&__timer);
+  struct tm __tm_info {};
+  localtime_r(&__timer, &__tm_info);
+  size_t rc = strftime(tm_buf, len, "%Y-%m-%d %H:%M:%S", &__tm_info);
+
+  if (rc == 0) {
+    return rc;
+  } else if (us) {
+    struct timeval tv;
+    struct tm *tm_info;
+
+    gettimeofday(&tv, NULL);
+    tm_info = localtime(&tv.tv_sec);
+    rc = snprintf(tm_buf + rc, len - rc, ".%06ld", tv.tv_usec);
+  }
+
+  return rc;
+}
+
+/**
   Emit the beginning of a test line, that is: "(not) ok", test number,
   and description.
 
@@ -84,9 +117,12 @@ static TEST_DATA g_test = { NO_PLAN, 0, 0, "" };
 static void
 vemit_tap(int pass, char const *fmt, va_list ap)
 {
-  fprintf(tapout, "%sok %d%s",
+  char tm_buf[28] = { 0 };
+  get_fmt_time(tm_buf, sizeof(tm_buf), __sync_add_and_fetch(&tap_log_us, 0));
+  fprintf(tapout, "%sok %d - %s%s",
           pass ? "" : "not ",
-          ++g_test.last,
+          __sync_add_and_fetch(&g_test.last, 1),
+          tm_buf,
           (fmt && *fmt) ? " - " : "");
   if (fmt && *fmt)
     vfprintf(tapout, fmt, ap);
@@ -155,7 +191,9 @@ diag(char const *fmt, ...)
 {
   va_list ap;
   va_start(ap, fmt);
-  fprintf(tapout, "# ");
+  char tm_buf[28] = { 0 };
+  get_fmt_time(tm_buf, sizeof(tm_buf), __sync_add_and_fetch(&tap_log_us, 0));
+  fprintf(tapout, "# %s  ", tm_buf);
   vfprintf(tapout, fmt, ap);
   emit_endl();
   va_end(ap);
@@ -167,14 +205,14 @@ typedef struct signal_entry {
 } signal_entry;
 
 static signal_entry install_signal[]= {
-  { SIGINT,  handle_core_signal },
-  { SIGQUIT, handle_core_signal },
-  { SIGILL,  handle_core_signal },
-  { SIGABRT, handle_core_signal },
-  { SIGFPE,  handle_core_signal },
-  { SIGSEGV, handle_core_signal }
+//  { SIGINT,  handle_core_signal },
+//  { SIGQUIT, handle_core_signal },
+//  { SIGILL,  handle_core_signal },
+//  { SIGABRT, handle_core_signal },
+//  { SIGFPE,  handle_core_signal },
+//  { SIGSEGV, handle_core_signal }
 #ifdef SIGBUS
-  , { SIGBUS,  handle_core_signal }
+    { SIGBUS,  handle_core_signal }
 #endif
 #ifdef SIGXCPU
   , { SIGXCPU, handle_core_signal }
@@ -191,6 +229,7 @@ static signal_entry install_signal[]= {
 };
 
 int skip_big_tests= 1;
+volatile int tap_log_us = 1;
 ulong start_time= 0;
 
 void
@@ -247,7 +286,7 @@ ok(int pass, char const *fmt, ...)
   va_start(ap, fmt);
 
   if (!pass && *g_test.todo == '\0')
-    ++g_test.failed;
+    __sync_add_and_fetch(&g_test.failed, 1);
 
   vemit_tap(pass, fmt, ap);
   va_end(ap);
@@ -264,7 +303,7 @@ ok1(int const pass)
   memset(&ap, 0, sizeof(ap));
 
   if (!pass && *g_test.todo == '\0')
-    ++g_test.failed;
+    __sync_add_and_fetch(&g_test.failed, 1);
 
   vemit_tap(pass, NULL, ap);
 
@@ -350,13 +389,13 @@ int exit_status()
 #include <time.h>
 #else
 #include <sys/times.h>
-#ifdef _SC_CLK_TCK				// For mit-pthreads
-#undef CLOCKS_PER_SEC
+//#ifdef _SC_CLK_TCK				// For mit-pthreads
+//#undef CLOCKS_PER_SEC
 #define CLOCKS_PER_SEC (sysconf(_SC_CLK_TCK))
-#endif
+//#endif
 #endif
 
-#define CLOCKS_PER_SEC 1000000
+//#define CLOCKS_PER_SEC 1000000
 
 static ulong start_timer(void)
 {
@@ -412,6 +451,10 @@ static void end_timer(ulong start_time,char *buff)
 
 int tests_failed() {
   return g_test.failed;
+}
+
+int tests_last() {
+  return g_test.last;
 }
 
 /**

@@ -32,16 +32,6 @@ extern MySQL_Threads_Handler *GloMTH;
 	} while (rc!=SQLITE_DONE );\
 } while (0)
 
-#define SAFE_SQLITE3_STEP2(_stmt) do {\
-	do {\
-		rc=(*proxy_sqlite3_step)(_stmt);\
-		if (rc==SQLITE_LOCKED || rc==SQLITE_BUSY) {\
-			usleep(100);\
-		}\
-	} while (rc==SQLITE_LOCKED || rc==SQLITE_BUSY);\
-} while (0)
-
-
 ProxySQL_Statistics::ProxySQL_Statistics() {
 	statsdb_mem = new SQLite3DB();
 	statsdb_mem->open((char *)"file:statsdb_mem?mode=memory&cache=shared", SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX);
@@ -218,7 +208,7 @@ bool ProxySQL_Statistics::MySQL_Query_Cache_timetoget(unsigned long long curtime
 }
 
 bool ProxySQL_Statistics::mysql_query_digest_to_disk_timetoget(unsigned long long curtime) {
-	unsigned int i = (unsigned int)variables.stats_mysql_query_digest_to_disk;
+	unsigned long i = (unsigned long)variables.stats_mysql_query_digest_to_disk;
 	if (i) {
 		if (
 			( curtime > next_timer_mysql_query_digest_to_disk )

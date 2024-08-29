@@ -23,7 +23,6 @@
 #include <resolv.h>
 #include <arpa/inet.h>
 #include <pthread.h>
-#include "SpookyV2.h"
 
 #include <fcntl.h>
 #include <sys/utsname.h>
@@ -41,25 +40,6 @@
 #define READ_ONLY_ON "\x01\x00\x00\x01\x02\x23\x00\x00\x02\x03\x64\x65\x66\x00\x00\x00\x0d\x56\x61\x72\x69\x61\x62\x6c\x65\x5f\x6e\x61\x6d\x65\x00\x0c\x21\x00\x0f\x00\x00\x00\xfd\x01\x00\x1f\x00\x00\x1b\x00\x00\x03\x03\x64\x65\x66\x00\x00\x00\x05\x56\x61\x6c\x75\x65\x00\x0c\x21\x00\x0f\x00\x00\x00\xfd\x01\x00\x1f\x00\x00\x05\x00\x00\x04\xfe\x00\x00\x02\x00\x0d\x00\x00\x05\x09\x72\x65\x61\x64\x5f\x6f\x6e\x6c\x79\x02\x4f\x4e\x05\x00\x00\x06\xfe\x00\x00\x02\x00"
 
 extern SQLite3_Server *GloSQLite3Server;
-
-#define SAFE_SQLITE3_STEP(_stmt) do {\
-  do {\
-    rc=sqlite3_step(_stmt);\
-    if (rc!=SQLITE_DONE) {\
-      assert(rc==SQLITE_LOCKED);\
-      usleep(100);\
-    }\
-  } while (rc!=SQLITE_DONE);\
-} while (0)
-
-#define SAFE_SQLITE3_STEP2(_stmt) do {\
-        do {\
-                rc=sqlite3_step(_stmt);\
-                if (rc==SQLITE_LOCKED || rc==SQLITE_BUSY) {\
-                        usleep(100);\
-                }\
-        } while (rc==SQLITE_LOCKED || rc==SQLITE_BUSY);\
-} while (0)
 
 void SQLite3_Server::init_aurora_ifaces_string(std::string& s) {
 	if(!s.empty())

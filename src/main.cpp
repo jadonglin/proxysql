@@ -4,12 +4,16 @@
 #include "btree_map.h"
 #include "proxysql.h"
 
+#include <random>
+#include <unistd.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 
 //#define PROXYSQL_EXTERN
 #include "cpp.h"
+
+#include "mysqld_error.h"
 
 #include "ProxySQL_Statistics.hpp"
 #include "MySQL_PreparedStatement.h"
@@ -21,22 +25,18 @@
 #include "MySQL_LDAP_Authentication.hpp"
 #include "proxysql_restapi.h"
 #include "Web_Interface.hpp"
+#include "proxysql_utils.h"
 
-#include <libdaemon/dfork.h>
-#include <libdaemon/dsignal.h>
-#include <libdaemon/dlog.h>
-#include <libdaemon/dpid.h>
-#include <libdaemon/dexec.h>
+#include "libdaemon/dfork.h"
+#include "libdaemon/dsignal.h"
+#include "libdaemon/dlog.h"
+#include "libdaemon/dpid.h"
+#include "libdaemon/dexec.h"
 #include "ev.h"
 
 #include "curl/curl.h"
 
-#include <openssl/x509v3.h>
-
-// Minimal headers for exporting metrics using prometheus
-#include <prometheus/counter.h>
-#include <prometheus/exposer.h>
-#include <prometheus/registry.h>
+#include "openssl/x509v3.h"
 
 #include <sys/mman.h>
 
@@ -49,7 +49,9 @@ extern "C" MySQL_LDAP_Authentication * create_MySQL_LDAP_Authentication_func() {
 */
 
 
-
+using std::map;
+using std::string;
+using std::vector;
 
 
 volatile create_MySQL_LDAP_Authentication_t * create_MySQL_LDAP_Authentication = NULL;
@@ -69,7 +71,7 @@ char *binary_sha1 = NULL;
 #endif
 
 static pthread_mutex_t *lockarray;
-#include <openssl/crypto.h>
+#include "openssl/crypto.h"
 
 
 // this fuction will be called as a deatached thread
@@ -104,18 +106,39 @@ static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, voi
 char * know_latest_version = NULL;
 static unsigned int randID = 0;
 
+/**
+ * @brief Checks for the latest version of ProxySQL by querying the specified URL.
+ *
+ * This function sends an HTTP GET request to the ProxySQL website to fetch the latest version information.
+ * It sets a custom user-agent string containing the version, SHA1 hash of the binary (if available), and a random ID.
+ * The response is stored in memory and returned as a character pointer.
+ *
+ * @return A character pointer containing the response data from the Proxysql website.
+ *         If an error occurs during the HTTP request, NULL is returned.
+ */
 static char * main_check_latest_version() {
-	CURL *curl_handle;
-	CURLcode res;
-	struct MemoryStruct chunk;
+	CURL *curl_handle; // CURL handle for performing HTTP requests
+	CURLcode res; // Variable to store CURL operation result
+	struct MemoryStruct chunk; // // Struct to store memory chunk received from HTTP response
+
+	// Initialize memory struct to store response data
 	chunk.memory = (char *)malloc(1);
 	chunk.size = 0;
+
+	// Initialize CURL library
 	curl_global_init(CURL_GLOBAL_ALL);
+	// Initialize CURL handle for HTTP request
 	curl_handle = curl_easy_init();
+	// Set CURL options for the HTTP request
 	curl_easy_setopt(curl_handle, CURLOPT_URL, "https://www.proxysql.com/latest");
+	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYHOST, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_SSL_VERIFYSTATUS, 0L);
+	curl_easy_setopt(curl_handle, CURLOPT_RANGE, "0-31");
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
 	curl_easy_setopt(curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
 
+	// Set custom user-agent string including ProxySQL version, binary SHA1 hash, and a random ID
 	string s = "proxysql-agent/";
 	s += PROXYSQL_VERSION;
 	if (binary_sha1) {
@@ -125,40 +148,68 @@ static char * main_check_latest_version() {
 	}
 	s += " " + std::to_string(randID);
 	curl_easy_setopt(curl_handle, CURLOPT_USERAGENT, s.c_str());
+
+	// Set timeout and connect timeout for the HTTP request
 	curl_easy_setopt(curl_handle, CURLOPT_TIMEOUT, 10);
 	curl_easy_setopt(curl_handle, CURLOPT_CONNECTTIMEOUT, 10);
 
+	// Perform the HTTP request
 	res = curl_easy_perform(curl_handle);
 
+	// Check if the request was successful
 	if (res != CURLE_OK) {
 		switch (res) {
+			// Handle common errors and free memory if necessary
 			case CURLE_COULDNT_RESOLVE_HOST:
 			case CURLE_COULDNT_CONNECT:
 			case CURLE_OPERATION_TIMEDOUT:
+				// These errors are expected in case of network issues or timeouts
 				break;
 			default:
+				// Log other errors using proxy_error and free memory
 				proxy_error("curl_easy_perform() failed: %s\n", curl_easy_strerror(res));
 				break;
 		}
 		free(chunk.memory);
 		chunk.memory = NULL;
 	}
+
+	// Cleanup CURL handle and global resources
 	curl_easy_cleanup(curl_handle);
 	curl_global_cleanup();
+
+	// Return the response data from the ProxySQL website
 	return chunk.memory;
 }
 
 
+/**
+ * @brief Thread function to check for the latest version of ProxySQL asynchronously.
+ *
+ * This function is intended to be executed as a separate thread to asynchronously check for the latest version of ProxySQL.
+ * It calls the main_check_latest_version function to fetch the latest version information from the ProxySQL website.
+ * If the fetched version information is valid and different from the currently known latest version,
+ * it updates the known latest version and logs a message indicating the availability of the new version.
+ *
+ * @param arg Pointer to the argument passed to the thread function (unused).
+ * @return NULL.
+ */
 void * main_check_latest_version_thread(void *arg) {
+	// Fetch the latest version information
 	char * latest_version = main_check_latest_version();
-	if (latest_version) {
+	// we check for potential invalid data , see issue #4042
+	// Check for potential invalid data and update the known latest version if a new version is detected
+	if (latest_version != NULL && strlen(latest_version) < 32) {
 		if (
 			(know_latest_version == NULL) // first check
 			|| (strcmp(know_latest_version,latest_version)) // new version detected
 		) {
+			// Free previously known latest version and update it with the new version
 			if (know_latest_version)
 				free(know_latest_version);
+			// Duplicate latest version string
 			know_latest_version = strdup(latest_version);
+			// Log the availability of the new version
 			proxy_info("Latest ProxySQL version available: %s\n", latest_version);
 		}
 	}
@@ -205,7 +256,6 @@ void parent_close_error_log() {
 	}
 }
 
-time_t laststart;
 pid_t pid;
 
 static const char * proxysql_pid_file() {
@@ -287,6 +337,7 @@ void ProxySQL_Main_init_SSL_module() {
 	}
 	//SSL_CTX_set_options(GloVars.global.ssl_ctx, SSL_OP_NO_SSLv3); // no necessary, because of previous SSL_CTX_set_min_proto_version
 #ifdef DEBUG
+#if 0
 	{
 		STACK_OF(SSL_CIPHER) *ciphers;
 		ciphers = SSL_CTX_get_ciphers(GloVars.global.ssl_ctx);
@@ -301,7 +352,8 @@ void ProxySQL_Main_init_SSL_module() {
 		}
 		fprintf(stderr,"\n");
 	}
-#endif
+#endif // 0
+#endif // DEBUG
 	std::string msg = "";
 	ProxySQL_create_or_load_TLS(true, msg);
 }
@@ -357,7 +409,7 @@ static volatile int load_;
 //#else
 //const char *malloc_conf = "xmalloc:true,lg_tcache_max:16,purge:decay";
 #ifndef __FreeBSD__
-const char *malloc_conf = "xmalloc:true,lg_tcache_max:16,prof:true,prof_leak:true,lg_prof_sample:20,lg_prof_interval:30,prof_active:false";
+const char *malloc_conf = "xmalloc:true,lg_tcache_max:16,prof:true,prof_accum:true,prof_leak:true,lg_prof_sample:20,lg_prof_interval:30,prof_active:false";
 #endif
 //#endif /* DEBUG */
 //const char *malloc_conf = "prof_leak:true,lg_prof_sample:0,prof_final:true,xmalloc:true,lg_tcache_max:16";
@@ -393,7 +445,6 @@ ClickHouse_Server *GloClickHouseServer;
 ProxySQL_Cluster *GloProxyCluster = NULL;
 
 ProxySQL_Statistics *GloProxyStats = NULL;
-
 
 void * mysql_worker_thread_func(void *arg) {
 
@@ -561,6 +612,30 @@ void ProxySQL_Main_process_global_variables(int argc, const char **argv) {
 				GloVars.ldap_auth_plugin=strdup(ldap_auth_plugin.c_str());
 			}
 		}
+		const map<string, char**> varnames_globals_map {
+			{ "mysql-ssl_p2s_ca", &GloVars.global.gr_bootstrap_ssl_ca },
+			{ "mysql-ssl_p2s_capath", &GloVars.global.gr_bootstrap_ssl_capath },
+			{ "mysql-ssl_p2s_cert", &GloVars.global.gr_bootstrap_ssl_cert },
+			{ "mysql-ssl_p2s_key", &GloVars.global.gr_bootstrap_ssl_key },
+			{ "mysql-ssl_p2s_cipher", &GloVars.global.gr_bootstrap_ssl_cipher },
+			{ "mysql-ssl_p2s_crl", &GloVars.global.gr_bootstrap_ssl_crl },
+			{ "mysql-ssl_p2s_crlpath", &GloVars.global.gr_bootstrap_ssl_crlpath }
+		};
+		// Command line options always take precedence
+		if (GloVars.global.gr_bootstrap_mode && root.exists("mysql_variables")) {
+			const Setting& mysql_vars = root["mysql_variables"];
+
+			for (const pair<const string,char**>& name_global : varnames_globals_map) {
+				for (const auto& setting_it : mysql_vars) {
+					if (*name_global.second == nullptr) {
+						if (setting_it.getName() == name_global.first && setting_it.isString()) {
+							const char* setting_val = setting_it.c_str();
+							*name_global.second = strdup(setting_val);
+						}
+					}
+				}
+			}
+		}
 	} else {
 		proxy_warning("Unable to open config file %s\n", GloVars.config_file); // issue #705
 		if (GloVars.__cmd_proxysql_config_file) {
@@ -670,7 +745,7 @@ void ProxySQL_Main_init_main_modules() {
 }
 
 
-void ProxySQL_Main_init_Admin_module() {
+void ProxySQL_Main_init_Admin_module(const bootstrap_info_t& bootstrap_info) {
 	// cluster module needs to be initialized before
 	GloProxyCluster = new ProxySQL_Cluster();
 	GloProxyCluster->init();
@@ -679,7 +754,7 @@ void ProxySQL_Main_init_Admin_module() {
 	//GloProxyStats->init();
 	GloProxyStats->print_version();
 	GloAdmin = new ProxySQL_Admin();
-	GloAdmin->init();
+	GloAdmin->init(bootstrap_info);
 	GloAdmin->print_version();
 	if (binary_sha1) {
 		proxy_info("ProxySQL SHA1 checksum: %s\n", binary_sha1);
@@ -749,6 +824,9 @@ void ProxySQL_Main_init_SQLite3Server() {
 	// start SQLite3Server
 	GloSQLite3Server = new SQLite3_Server();
 	GloSQLite3Server->init();
+	// NOTE: Always perform the 'load_*_to_runtime' after module start, otherwise values won't be properly
+	// loaded from disk at ProxySQL startup.
+	GloAdmin->load_sqliteserver_variables_to_runtime();
 	GloAdmin->init_sqliteserver_variables();
 	GloSQLite3Server->print_version();
 }
@@ -757,6 +835,9 @@ void ProxySQL_Main_init_ClickHouseServer() {
 	// start SQServer
 	GloClickHouseServer = new ClickHouse_Server();
 	GloClickHouseServer->init();
+	// NOTE: Always perform the 'load_*_to_runtime' after module start, otherwise values won't be properly
+	// loaded from disk at ProxySQL startup.
+	GloAdmin->load_clickhouse_variables_to_runtime();
 	GloAdmin->init_clickhouse_variables();
 	GloClickHouseServer->print_version();
 	GloClickHouseAuth = new ClickHouse_Authentication();
@@ -886,6 +967,9 @@ void ProxySQL_Main_shutdown_all_modules() {
 	}
 
 	{
+#ifdef TEST_WITHASAN
+		pthread_mutex_lock(&GloAdmin->sql_query_global_mutex);
+#endif
 		cpu_timer t;
 		delete GloAdmin;
 #ifdef DEBUG
@@ -914,7 +998,7 @@ void ProxySQL_Main_init() {
 	glovars.has_debug=false;
 #endif /* DEBUG */
 //	__thr_sfp=l_mem_init();
-
+	proxysql_init_debug_prometheus_metrics();
 }
 
 
@@ -923,7 +1007,9 @@ void ProxySQL_Main_init() {
 
 static void LoadPlugins() {
 	GloMyLdapAuth = NULL;
-	SQLite3DB::LoadPlugin(GloVars.sqlite3_plugin);
+	if (proxy_sqlite3_open_v2 == nullptr) {
+		SQLite3DB::LoadPlugin(GloVars.sqlite3_plugin);
+	}
 	if (GloVars.web_interface_plugin) {
 		dlerror();
 		char * dlsym_error = NULL;
@@ -950,6 +1036,8 @@ static void LoadPlugins() {
 			if (GloWebInterface) {
 				//GloAdmin->init_WebInterfacePlugin();
 				//GloAdmin->load_ldap_variables_to_runtime();
+			} else {
+				proxy_error("Failed to load 'Web_Interface' plugin\n");
 			}
 		}
 	}
@@ -976,6 +1064,11 @@ static void LoadPlugins() {
 			exit(EXIT_FAILURE);
 		} else {
 			GloMyLdapAuth = create_MySQL_LDAP_Authentication();
+
+			if (!GloMyLdapAuth) {
+				proxy_error("Failed to load 'MySQL_LDAP_Authentication' plugin\n");
+			}
+
 			// we are removing this from here, and copying in
 			//     ProxySQL_Main_init_phase2___not_started
 			// the keep record of these two lines to make sure we don't
@@ -999,11 +1092,14 @@ void UnloadPlugins() {
 	}
 }
 
-void ProxySQL_Main_init_phase2___not_started() {
+void ProxySQL_Main_init_phase2___not_started(const bootstrap_info_t& boostrap_info) {
+	std::string msg;
+	ProxySQL_create_or_load_TLS(false, msg);
+
 	LoadPlugins();
 
 	ProxySQL_Main_init_main_modules();
-	ProxySQL_Main_init_Admin_module();
+	ProxySQL_Main_init_Admin_module(boostrap_info);
 	GloMTH->print_version();
 
 	{
@@ -1019,7 +1115,6 @@ void ProxySQL_Main_init_phase2___not_started() {
 	}
 
 	if (GloMyLdapAuth) {
-		GloAdmin->init_ldap();
 		GloAdmin->load_ldap_variables_to_runtime();
 	}
 
@@ -1049,7 +1144,6 @@ void ProxySQL_Main_init_phase3___start_all() {
 		GloAdmin->init_mysql_servers();
 		GloAdmin->init_proxysql_servers();
 		GloAdmin->load_scheduler_to_runtime();
-		GloAdmin->proxysql_restapi().load_restapi_to_runtime();
 #ifdef DEBUG
 		std::cerr << "Main phase3 : GloAdmin initialized in ";
 #endif
@@ -1076,7 +1170,11 @@ void ProxySQL_Main_init_phase3___start_all() {
 #endif
 	}
 
-	do { /* nothing */ } while (load_ != 1);
+	do { /* nothing */
+#ifdef DEBUG
+		usleep(5+rand()%10);
+#endif
+	} while (load_ != 1);
 	load_ = 0;
 	__sync_fetch_and_add(&GloMTH->status_variables.threads_initialized, 1);
 
@@ -1117,6 +1215,17 @@ void ProxySQL_Main_init_phase3___start_all() {
 	if (GloMyLdapAuth) {
 		GloAdmin->init_ldap_variables();
 	}
+
+	// HTTP Server should be initialized after other modules. See #4510
+	GloAdmin->init_http_server();
+	GloAdmin->proxysql_restapi().load_restapi_to_runtime();
+
+	// Signal ProxySQL_Admin that all modules have been started
+	GloAdmin->all_modules_started = true;
+
+	// Load the config not previously loaded for these modules
+	GloAdmin->load_http_server();
+	GloAdmin->load_restapi_server();
 }
 
 
@@ -1136,40 +1245,76 @@ void ProxySQL_Main_init_phase4___shutdown() {
 #endif
 }
 
-
+/**
+ * @brief Phase 1 of the daemonization process for ProxySQL.
+ *
+ * This function performs the first phase of the daemonization process for ProxySQL. It sets up essential parameters
+ * and checks for conditions necessary for daemonization. If any of the conditions are not met or if an error occurs,
+ * the function logs an error message and exits with a failure status code.
+ *
+ * @param argv0 The name of the executable file used to start ProxySQL.
+ * @return void.
+ * @note This function does not return if an error occurs; it exits the process.
+ */
 void ProxySQL_daemonize_phase1(char *argv0) {
-	int rc;
+	int rc; // Variable to store the return code of system calls
+
+	// Set the PID file identification to the global PID variable
 	daemon_pid_file_ident=GloVars.pid;
+
+	// Set the log identification based on the executable file name
 	daemon_log_ident=daemon_ident_from_argv0(argv0);
+
+	// Change the current working directory to the data directory
 	rc=chdir(GloVars.datadir);
 	if (rc) {
+		// Log an error message if changing the directory fails and exit with failure status
 		daemon_log(LOG_ERR, "Could not chdir into datadir: %s . Error: %s", GloVars.datadir, strerror(errno));
 		exit(EXIT_FAILURE);
 	}
-	daemon_pid_file_proc=proxysql_pid_file;
+
+	// Set the PID file process to the ProxySQL PID file
+	daemon_pid_file_proc = proxysql_pid_file;
+
+	// Check if ProxySQL is already running by checking the PID file
 	pid=daemon_pid_file_is_running();
 	if (pid>=0) {
+		// Log an error message if ProxySQL is already running and exit with failure status
 		daemon_log(LOG_ERR, "Daemon already running on PID file %u", pid);
 		exit(EXIT_FAILURE);
 	}
 	if (daemon_retval_init() < 0) {
+		// Initialize the return value for daemonization; log an error if initialization fails
 		daemon_log(LOG_ERR, "Failed to create pipe.");
 		exit(EXIT_FAILURE);
 	}
 }
 
-
+/**
+ * @brief Wait for the return value from the daemon process.
+ *
+ * This function waits for the return value from the daemon process for a specified duration. If the return value is
+ * received within the specified time, the function logs the return value. If an error occurs during the waiting process,
+ * the function logs an error message and exits with a failure status code.
+ *
+ * @return void.
+ * @note This function does not return if an error occurs; it exits the process.
+ */
 void ProxySQL_daemonize_wait_daemon() {
-	int ret;
-	/* Wait for 20 seconds for the return value passed from the daemon process */
+	int ret; // Variable to store the return value from daemon_retval_wait()
+	// Wait for 20 seconds for the return value passed from the daemon process
 	if ((ret = daemon_retval_wait(20)) < 0) {
+		// Log an error message if waiting for the return value fails and exit with failure status
 		daemon_log(LOG_ERR, "Could not receive return value from daemon process: %s", strerror(errno));
 		exit(EXIT_FAILURE);
 	}
 
+	// If a return value is received, log it
 	if (ret) {
 		daemon_log(LOG_ERR, "Daemon returned %i as return value.", ret);
 	}
+
+	// Exit with the return value received from the daemon process
 	exit(ret);
 }
 
@@ -1212,28 +1357,60 @@ bool ProxySQL_daemonize_phase2() {
 	return true;
 }
 
-
+/**
+ * @brief Calls an external script upon exit failure.
+ *
+ * This function attempts to execute an external script specified in the global variable `GloVars.execute_on_exit_failure`
+ * if the program exits due to failure. It first checks if the variable is set, and if not, returns without further action.
+ * If the variable is set, it attempts to fork a child process to execute the script. If forking fails, the function exits
+ * with failure status. If forking succeeds, the child process attempts to execute the script using the `system` function.
+ * If the script execution fails, an error message is logged, and the child process exits with failure status. Otherwise, the
+ * child process exits with success status. Additionally, the function creates a detached thread to wait for the child process
+ * to exit, ensuring that the parent process does not block. If thread creation fails, the function logs an error message and
+ * exits with failure status.
+ *
+ * @return void.
+ * @note This function does not return if an error occurs; it exits the process.
+ */
 void call_execute_on_exit_failure() {
+	// Check if the global variable execute_on_exit_failure is NULL
 	if (GloVars.execute_on_exit_failure == NULL) {
+		// Exit the function if the variable is not set
 		return;
 	}
+
+	// Log a message indicating the attempt to call the external script
 	proxy_error("Trying to call external script after exit failure: %s\n", GloVars.execute_on_exit_failure);
+
+	// Fork a child process
 	pid_t cpid;
 	cpid = fork();
+
+	// Check for fork failure
 	if (cpid == -1) {
+		// Exit with failure status if fork fails
 		exit(EXIT_FAILURE);
 	}
+
+	// Child process
 	if (cpid == 0) {
 		int rc;
+		// Execute the external script
 		rc = system(GloVars.execute_on_exit_failure);
+
+		// Check if script execution failed
 		if (rc) {
+			// Log an error message and exit with failure status if execution fails
 			proxy_error("Execute on EXIT_FAILURE: Failed to run %s\n", GloVars.execute_on_exit_failure);
 			perror("system()");
 			exit(EXIT_FAILURE);
 		} else {
+			// Exit with success status if script execution succeeds
 			exit(EXIT_SUCCESS);
 		}
-	} else {
+	}
+	// Parent process
+	else {
 		pthread_attr_t attr;
 		pthread_attr_init(&attr);
 		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
@@ -1241,6 +1418,8 @@ void call_execute_on_exit_failure() {
 		pid_t *cpid_ptr=(pid_t *)malloc(sizeof(pid_t));
 		*cpid_ptr=cpid;
 		pthread_t thr;
+
+		// Create a detached thread to wait for the child process to exit
 		if (pthread_create(&thr, &attr, waitpid_thread, (void *)cpid_ptr) !=0 ) {
 			perror("Thread creation");
 			exit(EXIT_FAILURE);
@@ -1303,7 +1482,490 @@ namespace {
 	static const bool SET_TERMINATE = std::set_terminate(my_terminate);
 }
 
+/**
+ * @brief Regex for parsing URI connections.
+ * @details Groups explanation:
+ *  + HierPart doesn't hold '//' making previous non-capturing group optional. E.g:
+ *     - '127.0.0.1:3306'
+ *     - 'mysql-server-1:3306'
+ *  + UserInfo is inside a non-capturing group to avoid matching '@'.
+ *  + Host,Port groups are inside a non-capturing group to allow URI like: 'mysql://user:pass@'
+ *  + RegName matches any valid Ipv4 or domain name.
+ *  + Ipv6 matches Ipv6, it's NOT spec conforming, we don't verify the supplied Ip in the regex.
+ *  + Port matches the supplied port.
+ *  + Optionally match a supplied (/).
+ *  + Ensure match termination in HierPart group, forcing conditional subgroups matching.
+ */
+const char CONN_URI_REGEX[] {
+	"^(:?(?P<Scheme>[a-z][a-z0-9\\+\\-\\.]*):\\/\\/)?"
+	"(?P<HierPart>"
+		"(?:(?P<UserInfo>(?:\\%[0-9a-f][0-9a-f]|[a-z0-9\\-\\.\\_\\~]|[\\!\\$\\&\\'\\(\\)\\*\\+\\,\\;\\=]|\\:)*)\\@)?"
+		"(:?"
+			"(?P<Host>"
+				"(?P<RegName>(?:\\%[0-9a-f][0-9a-f]|[a-z0-9\\-\\.\\_\\~]|[\\!\\$\\&\\'\\(\\)\\*\\+\\,\\;\\=]])*)|"
+				"(?P<Ipv6>\\[(?:[0-9a-f]|[\\:])*\\]))"
+			"(?:\\:(?P<Port>[0-9]+)?)?"
+		")?"
+		"(?:\\/)?"
+	")?$"
+};
+
+/**
+ * @brief Holds each of the groups matched in a string by 'CONN_URI_REGEX'.
+ */
+struct conn_uri_t {
+	string scheme;
+	string hierpart;
+	string user;
+	string pass;
+	string host;
+	uint32_t port;
+};
+
+/**
+ * @brief Uses Regex 'CONN_URI_REGEX' to parse the supplied string.
+ * @details Tries to perform a 'PartialMatchN' over the 'CONN_URI_REGEX'. Right now doesn't perform a *full*
+ *   check on the validity of the semantics of the URI itself. It does perform some checks.
+ * @param conn_uri A connection URI.
+ * @return On success `{EXIT_SUCCESS, conn_uri_t}`, otherwise `{EXIT_FAILURE, conn_uri_t{}}`. Error cause is
+ *   logged.
+ */
+pair<int,conn_uri_t> parse_conn_uri(const string& conn_uri) {
+	re2::RE2::Options opts(RE2::Quiet);
+	opts.set_case_sensitive(false);
+
+	re2::RE2 re(CONN_URI_REGEX, opts);;
+	if (re.error_code()) {
+		proxy_error("Regex creation failed - %s\n", re.error().c_str());
+		assert(0);
+	}
+
+	const int num_groups = re.NumberOfCapturingGroups();
+	std::vector<std::string> str_args(num_groups, std::string {});
+	std::vector<RE2::Arg> re2_args {};
+
+	for (std::string& str_arg : str_args) {
+		re2_args.push_back(RE2::Arg(&str_arg));
+	}
+
+	std::vector<const RE2::Arg*> matches {};
+	for (RE2::Arg& re2_arg : re2_args) {
+		matches.push_back(&re2_arg);
+	}
+
+	const re2::RE2::Arg* const* args = &matches[0];
+	RE2::PartialMatchN(conn_uri, re, args, num_groups);
+
+	const map<string, int>& groups = re.NamedCapturingGroups();
+	map<string,int>::const_iterator group_it;
+
+	string scheme {};
+	string hierpart {};
+	string userinfo {};
+	string host {};
+	uint32_t port = 0;
+
+	if ((group_it = groups.find("Scheme")) != groups.end()) { scheme = str_args[group_it->second - 1]; }
+	if ((group_it = groups.find("HierPart")) != groups.end()) { hierpart = str_args[group_it->second - 1]; }
+	if ((group_it = groups.find("UserInfo")) != groups.end()) { userinfo = str_args[group_it->second - 1]; }
+	if ((group_it = groups.find("Host")) != groups.end()) { host = str_args[group_it->second - 1]; }
+
+	// Remove the enclosing(`[]`) from IPv6 addresses
+	if (host.empty() == false && host.size() > 2) {
+		if (host[0] == '[') {
+			host = host.substr(1, host.size()-2);
+		}
+	}
+
+	string user {};
+	string pass {};
+
+	int32_t match_err = EXIT_SUCCESS;
+
+	// Extract supplied info for user:pass
+	vector<string> v_userinfo = split_str(userinfo, ':');
+	if (v_userinfo.size() == 1) {
+		user = v_userinfo[0];
+	} else if (v_userinfo.size() == 2) {
+		user = v_userinfo[0];
+		pass = v_userinfo[1];
+	} else if (v_userinfo.size() > 2) {
+		proxy_error(
+			"Invalid UserInfo '%s' supplied in connection URI. UserInfo should contain at max two fields 'user:pass'\n",
+			userinfo.c_str()
+		);
+		match_err = EXIT_FAILURE;
+	}
+
+	if ((group_it = groups.find("Port")) != groups.end()) {
+		const string s_port { str_args[group_it->second - 1] };
+
+		if (!s_port.empty()) {
+			char* p_end = nullptr;
+			port = std::strtol(s_port.c_str(), &p_end, 10);
+
+			if (errno == ERANGE || p_end == s_port.c_str()) {
+				proxy_error("Invalid Port '%s' supplied in connection URI.\n", s_port.c_str());
+				match_err = EXIT_FAILURE;
+			}
+		}
+	}
+
+	struct conn_uri_t uri_data { scheme, hierpart, user, pass, host, port };
+
+	return { match_err, uri_data };
+}
+
+/**
+ * @brief Helper function to serialize 'conn_uri_t' for debugging purposes.
+ */
+string to_string(const conn_uri_t& conn_uri) {
+	nlohmann::ordered_json j;
+
+	j["scheme"] = conn_uri.scheme;
+	j["user"] = conn_uri.user;
+#ifdef DEBUG
+	j["pass"] = conn_uri.pass;
+#endif
+	j["host"] = conn_uri.host;
+	j["port"] = conn_uri.port;
+
+	return j.dump();
+}
+
+/**
+ * @brief Query for fetching MySQL users during bootstrapping.
+ * @details For security reasons, users matching the following names are excluded:
+ *   - `mysql.%`
+ *   - `root`
+ *   - `bt_proxysql_%`
+ *   Users starting with `bt_proxysql_` are considered `ProxySQL` created used during `bootstrap` for
+ *   monitoring purposes. A user, could create it's own monitoring accounts under this prefix, to avoid
+ *   ProxySQL fetching them as regular users.
+ */
+const char BOOTSTRAP_SELECT_USERS[] {
+	"SELECT DISTINCT user,ssl_type,authentication_string,plugin,password_expired FROM mysql.user"
+		" WHERE user NOT LIKE 'mysql.%' AND user NOT LIKE 'bt_proxysql_%'"
+#ifndef DEBUG
+		" AND user != 'root'"
+#endif
+};
+
+/**
+ * @brief Query for fetching MySQL servers during bootstrapping.
+ * @details As the regular GR monitoring queries, makes use of `replication_group_members` table.
+ */
+const char BOOTSTRAP_SELECT_SERVERS[] {
+	"SELECT MEMBER_ID,MEMBER_HOST,MEMBER_PORT,MEMBER_STATE,MEMBER_ROLE,MEMBER_VERSION FROM"
+		" performance_schema.replication_group_members"
+};
+
+/**
+ * @brief Stores credentials for monitoring created accounts during bootstrap.
+ */
+struct acct_creds_t {
+	string user;
+	string pass;
+};
+
+/**
+ * @brief Minimal set of permissions for a created GR monitoring account.
+ * @details Right now we **do not grant** permissions to `mysql_innodb_cluster_metadata` tables, since for now
+ *   we don't make any use of them.
+ */
+const vector<string> t_grant_perms_queries {
+	"GRANT USAGE ON *.* TO `%s`@`%%`",
+//  NOTE: For now, we don't make use of any `mysql_innodb_cluster_metadata` tables
+//	"GRANT SELECT, EXECUTE ON `mysql_innodb_cluster_metadata`.* TO `%s`@`%%`",
+//  NOTE: For now, we don't make use of 'routers' and 'v2_routers' table
+//	"GRANT INSERT, UPDATE, DELETE ON `mysql_innodb_cluster_metadata`.`routers` TO `%s`@`%%`",
+//	"GRANT INSERT, UPDATE, DELETE ON `mysql_innodb_cluster_metadata`.`v2_routers` TO `%s`@`%%`",
+	"GRANT SELECT ON `performance_schema`.`global_variables` TO `%s`@`%%`",
+	"GRANT SELECT ON `performance_schema`.`replication_group_member_stats` TO `%s`@`%%`",
+	"GRANT SELECT ON `performance_schema`.`replication_group_members` TO `%s`@`%%`"
+};
+
+/**
+ * @brief Grants the minimal set of permissions for GR monitoring to a supplies user.
+ * @details All permissions will be granted for host `%`.
+ * @param mysql An already opened MySQL connection.
+ * @param user The username to grant permissions to.
+ * @return Either `0` for success, or the corresponding `mysql_errno` for failure.
+ */
+int grant_user_perms(MYSQL* mysql, const string& user) {
+	for (const string& t_query : t_grant_perms_queries) {
+		const string query { cstr_format(t_query.c_str(), user.c_str()).str };
+
+		proxy_info("GRANT permissions '%s' to user\n", query.c_str());
+		int myerr = mysql_query(mysql, query.c_str());
+		if (myerr) {
+			return mysql_errno(mysql);
+		}
+	}
+
+	return 0;
+}
+
+/**
+ * @brief Generates a random password conforming with MySQL 'MEDIUM' policy.
+ * @param size The target password size.
+ * @return The random password generated.
+ */
+string gen_rand_password(std::size_t size) {
+	const string lowercase { "abcdefghijklmnopqrstuvwxyz" };
+	const string uppercase { "ABCDEFGHIJKLMNOPQRSTUVWXYZ" };
+	const string digits { "0123456789" };
+	const string symbols { "~@#$^&*]}[{()|-=+;:.>,</?" };
+	string allphabet { lowercase + uppercase + digits + symbols };
+
+	std::random_device rd {};
+	std::mt19937 gen { rd() };
+
+	string pass {};
+
+	if (size == 0) {
+		return pass;
+	} else if (size <= 4) {
+		std::shuffle(allphabet.begin(), allphabet.end(), gen);
+		pass = allphabet.substr(0, size);
+	} else {
+		// 1 numeric character
+		pass += digits[gen() % digits.size()];
+		// 1 lowercase character
+		pass += lowercase[gen() % lowercase.size()];
+		// 1 uppercase character
+		pass += toupper(lowercase[gen() % lowercase.size()]);
+		// 1 special (nonalphanumeric) character
+		pass += symbols[gen() % symbols.size()];
+
+		std::shuffle(allphabet.begin(), allphabet.end(), gen);
+		std::size_t remains = size - 4;
+
+		if (remains < allphabet.size()) {
+			pass += allphabet.substr(0, remains);
+		} else {
+			std::size_t req_modulus = static_cast<std::size_t>(remains / allphabet.size());
+			std::size_t req_reminder = remains % allphabet.size();
+
+			for (std::size_t i = 0; i < req_modulus; i++) {
+				std::shuffle(allphabet.begin(), allphabet.end(), gen);
+				pass += allphabet;
+			}
+
+			std::shuffle(allphabet.begin(), allphabet.end(), gen);
+			pass += allphabet.substr(0, req_reminder);
+		}
+	}
+
+	return pass;
+}
+
+/**
+ * @brief Creates a random monitoring account for bootstrap with a random generated password.
+ * @param mysql An already opened MySQL connection.
+ * @param max_retries Maximum number of attempts for creating the user.
+ * @return On success `{0, acct_creds_t}`, otherwise `{mysql_errno, acct_creds_t{}}`. Error cause is logged.
+ */
+pair<int32_t,acct_creds_t> create_random_bootstrap_account(MYSQL* mysql, uint32_t max_retries) {
+	// Random username
+	const string monitor_user { "bt_proxysql_" + rand_str(12) };
+	string monitor_pass {};
+
+	int myerr = ER_NOT_VALID_PASSWORD;
+	uint32_t retries = 0;
+
+	while (retries < max_retries && (myerr == ER_NOT_VALID_PASSWORD)) {
+		monitor_pass = gen_rand_password(16);
+
+		const string user_create {
+			"CREATE USER IF NOT EXISTS '" + monitor_user + "'@'%' IDENTIFIED BY '" + monitor_pass + "'"
+		};
+
+		int myres = mysql_query(mysql, user_create.c_str());
+		myerr = mysql_errno(mysql);
+
+		if (myres || myerr) {
+			if (myerr != ER_NOT_VALID_PASSWORD) {
+				return { myerr, { "", "" } };
+			} else {
+				proxy_info(
+					"Bootstrap config, failed to create password for user '%s'. Retrying...\n", monitor_user.c_str()
+				);
+				retries += 1;
+			}
+		} else {
+			break;
+		}
+	}
+
+	if (myerr == 0) {
+		myerr = grant_user_perms(mysql, monitor_user);
+	}
+
+	return { myerr, { monitor_user, monitor_pass } };
+}
+
+/**
+ * @brief Creates a monitoring account for bootstrap with the supplied parameters.
+ * @param mysql An already opened MySQL connection.
+ * @param user The username for the new account.
+ * @param pass The password for the new account.
+ * @return On success `{0,acct_creds_t}`, otherwise `{mysql_errno,acct_creds_t}`. Doesn't log errors.
+ */
+pair<int32_t,acct_creds_t> create_bootstrap_account(MYSQL* mysql, const string& user, const string& pass) {
+	const string monitor_user { "'" + user + "'" };
+	const string user_create {
+		"CREATE USER IF NOT EXISTS " + monitor_user + "@'%' IDENTIFIED BY '" + pass + "'"
+	};
+
+	int myerr = mysql_query(mysql, user_create.c_str());
+
+	if (myerr == 0) {
+		myerr = grant_user_perms(mysql, user);
+	}
+
+	return { myerr, { user, pass } };
+}
+
+
+/**
+ * @brief This function handles the restart of a process based on certain conditions.
+ * 
+ * If glovars.proxy_restart_on_error is true, the process restart logic is executed.
+ * The function implements exponential backoff and terminates if the maximum number of restart attempts is reached.
+ */
+void handleProcessRestart() {
+	// Maximum number of restart attempts allowed
+	constexpr int MAX_RESTART_ATTEMPTS = 5;
+	// Threshold in seconds for considering restarts too frequent
+	constexpr int EXECUTION_THRESHOLD = 10;
+
+	// Initialize restart attempts counter
+	time_t laststart = 0;
+	int restartAttempts = 0;
+	do {
+		// Check if laststart is set. It means that the process was already started at least once
+		if (laststart) {
+			// Get current time
+			time_t currenttime = time(NULL);
+			// Calculate elapsed time since laststart
+			time_t elapsed_seconds = currenttime - laststart;
+
+			// Check if elapsed time is less than threshold
+			if (elapsed_seconds < EXECUTION_THRESHOLD) {
+				// if restart is too frequent, something really bad is going on
+				// Implement exponential backoff - wait exponentially longer after each failed attempt
+				restartAttempts++;
+
+				// Check if restart attempts exceed the maximum allowed
+				if (restartAttempts > MAX_RESTART_ATTEMPTS) {
+					// the parent exits before the fork
+					parent_open_error_log();
+					proxy_error("Angel process already attempted to restart ProxySQL %d times and has no retries left. exit() with failure.\n", MAX_RESTART_ATTEMPTS);
+					exit(EXIT_FAILURE);
+				}
+
+				// Calculate wait time using exponential backoff
+				int waitTime = 1 << restartAttempts;
+				parent_open_error_log();
+				proxy_info("ProxySQL exited after only %ld seconds , below the %d seconds threshold. Restarting attempt %d\n", elapsed_seconds, EXECUTION_THRESHOLD, restartAttempts);
+				proxy_info("Angel process is waiting %d seconds before starting a new ProxySQL process\n", waitTime);
+				parent_close_error_log();
+
+				// Wait for the calculated time before next restart attempt
+				sleep(waitTime);
+			} else {
+				// Reset restart attempts counter if elapsed time is greater than or equal to threshold
+				restartAttempts = 0;
+			}
+		}
+
+		// Update laststart time to current time
+		laststart=time(NULL);
+
+		// Fork the process
+		pid = fork();
+
+		// Check for fork error
+		if (pid < 0) {
+			parent_open_error_log();
+			proxy_error("[FATAL]: Error in fork()\n");
+
+			// Exit with failure
+			exit(EXIT_FAILURE);
+		}
+
+		// Check if the process is the parent
+		if (pid) { // The parent
+			parent_close_error_log();
+			if (ProxySQL_daemonize_phase3()==true) {
+				break;
+			}
+		} else { // The daemon
+			// we open the files also on the child process
+			// this is required if the child process was created after a crash
+			parent_open_error_log();
+			GloVars.global.start_time=monotonic_time();
+			GloVars.install_signal_handler();
+		}
+	} while (pid > 0);
+}
+
+#ifndef NOJEM
+int print_jemalloc_conf() {
+	int rc = 0;
+
+	bool xmalloc = 0;
+	bool prof_accum = 0;
+	bool prof_leak = 0;
+
+	size_t lg_cache_max = 0;
+	size_t lg_prof_sample = 0;
+	size_t lg_prof_interval = 0;
+
+	size_t bool_sz = sizeof(bool);
+	size_t size_sz = sizeof(size_t);
+	size_t ssize_sz = sizeof(ssize_t);
+
+	rc = mallctl("config.xmalloc", &xmalloc, &bool_sz, NULL, 0);
+	if (rc) { proxy_error("Failed to fetch 'config.xmalloc' with error %d", rc); return rc; }
+
+	rc = mallctl("opt.lg_tcache_max", &lg_cache_max, &size_sz, NULL, 0);
+	if (rc) { proxy_error("Failed to fetch 'opt.lg_tcache_max' with error %d", rc);  return rc; }
+
+	rc = mallctl("opt.prof_accum", &prof_accum, &bool_sz, NULL, 0);
+	if (rc) { proxy_error("Failed to fetch 'opt.prof_accum' with error %d", rc); return rc; }
+
+	rc = mallctl("opt.prof_leak", &prof_leak, &bool_sz, NULL, 0);
+	if (rc) { proxy_error("Failed to fetch 'opt.prof_leak' with error %d", rc);  return rc; }
+
+	rc = mallctl("opt.lg_prof_sample", &lg_prof_sample, &size_sz, NULL, 0);
+	if (rc) { proxy_error("Failed to fetch 'opt.lg_prof_sample' with error %d", rc);  return rc; }
+
+	rc = mallctl("opt.lg_prof_interval", &lg_prof_interval, &ssize_sz, NULL, 0);
+	if (rc) { proxy_error("Failed to fetch 'opt.lg_prof_interval' with error %d", rc);  return rc; }
+
+	proxy_info(
+		"Using jemalloc with MALLOC_CONF:"
+			" config.xmalloc:%d, lg_tcache_max:%lu, opt.prof_accum:%d, opt.prof_leak:%d,"
+			" opt.lg_prof_sample:%lu, opt.lg_prof_interval:%lu, rc:%d\n",
+		xmalloc, lg_cache_max, prof_accum, prof_leak, lg_prof_sample, lg_prof_interval, rc
+	);
+
+	return 0;
+}
+#else
+int print_jemalloc_conf() {
+	return 0;
+}
+#endif
+
 int main(int argc, const char * argv[]) {
+	// Output current jemalloc conf; no action taken when disabled
+	{
+		int rc = print_jemalloc_conf();
+		if (rc) { exit(EXIT_FAILURE); }
+	}
 
 	{
 		MYSQL *my = mysql_init(NULL);
@@ -1314,6 +1976,13 @@ int main(int argc, const char * argv[]) {
 //		std::cerr << "Main init phase0 completed in ";
 #endif
 	}
+#ifdef DEBUG
+	{
+		// Automated testing
+		SetParser parser("");
+		parser.test_parse_USE_query();
+	}
+#endif // DEBUG
 	{
 		cpu_timer t;
 		ProxySQL_Main_process_global_variables(argc, argv);
@@ -1329,27 +1998,308 @@ int main(int argc, const char * argv[]) {
 	{
 		int rc = getrlimit(RLIMIT_NOFILE, &nlimit);
 		if (rc == 0) {
-			proxy_info("Current RLIMIT_NOFILE: %d\n", nlimit.rlim_cur);
+			proxy_info("Current RLIMIT_NOFILE: %lu\n", nlimit.rlim_cur);
 			if (nlimit.rlim_cur <= 1024) {
-				proxy_error("Current RLIMIT_NOFILE is very low: %d .  Tune RLIMIT_NOFILE correctly before running ProxySQL\n", nlimit.rlim_cur);
+				proxy_error("Current RLIMIT_NOFILE is very low: %lu .  Tune RLIMIT_NOFILE correctly before running ProxySQL\n", nlimit.rlim_cur);
 				if (nlimit.rlim_max > nlimit.rlim_cur) {
 					if (nlimit.rlim_max >= 102400) {
 						nlimit.rlim_cur = 102400;
 					} else {
 						nlimit.rlim_cur = nlimit.rlim_max;
 					}
-					proxy_warning("Automatically setting RLIMIT_NOFILE to %d\n", nlimit.rlim_cur);
+					proxy_warning("Automatically setting RLIMIT_NOFILE to %lu\n", nlimit.rlim_cur);
 					rc = setrlimit(RLIMIT_NOFILE, &nlimit);
 					if (rc) {
 						proxy_error("Unable to increase RLIMIT_NOFILE: %s: \n", strerror(errno));
 					}
 				} else {
-					proxy_error("Unable to increase RLIMIT_NOFILE because rlim_max is low: %d\n", nlimit.rlim_max);
+					proxy_error("Unable to increase RLIMIT_NOFILE because rlim_max is low: %lu\n", nlimit.rlim_max);
 				}
 			}
 		} else {
 			proxy_error("Call to getrlimit failed: %s\n", strerror(errno));
 		}
+	}
+
+	bootstrap_info_t bootstrap_info {};
+	// Try to connect to MySQL for performing the bootstrapping process:
+	//   - If data isn't found we perform the bootstrap process.
+	//   - If non-empty datadir is present, reconfiguration should be performed.
+	if (GloVars.global.gr_bootstrap_mode == 1) {
+		// Check the other required arguments for performing the bootstrapping process:
+		//  - Username
+		//  - Password - asked by prompt or supplied
+		//  - Connection string parsing is required
+		const string conn_uri { GloVars.global.gr_bootstrap_uri };
+		const pair<int32_t,conn_uri_t> parse_uri_res { parse_conn_uri(conn_uri) };
+		const conn_uri_t uri_data = parse_uri_res.second;
+
+		if (parse_uri_res.first == EXIT_FAILURE) {
+			proxy_info("Aborting bootstrap due to failed to parse or match URI - `%s`\n", to_string(uri_data).c_str());
+			exit(parse_uri_res.first);
+		} else {
+			proxy_info("Bootstrap connection data supplied via URI - `%s`\n", to_string(uri_data).c_str());
+		}
+
+		const char* c_host = uri_data.host.c_str();
+		const char* c_user = uri_data.user.empty() ? "root" : uri_data.user.c_str();
+		const char* c_pass = nullptr;
+		uint32_t port = uri_data.port == 0 ? 3306 : uri_data.port;
+		uint32_t flags = CLIENT_SSL;
+
+		nlohmann::ordered_json conn_data { { "host", c_host }, { "user", c_user }, { "port", port } };
+		proxy_info("Performing bootstrap connection using URI data and defaults - `%s`\n", conn_data.dump().c_str());
+
+		if (uri_data.pass.empty()) {
+			c_pass = getpass("Enter password: ");
+		} else {
+			c_pass = uri_data.pass.c_str();
+		}
+
+		MYSQL* mysql = mysql_init(NULL);
+
+		// SSL explicitly disabled by user for backend connections
+		if (GloVars.global.gr_bootstrap_ssl_mode) {
+			if (!strcasecmp(GloVars.global.gr_bootstrap_ssl_mode, "DISABLED")) {
+				flags = 0;
+			}
+		}
+
+		if (flags == CLIENT_SSL) {
+			mysql_ssl_set(
+				mysql,
+				GloVars.global.gr_bootstrap_ssl_key,
+				GloVars.global.gr_bootstrap_ssl_cert,
+				GloVars.global.gr_bootstrap_ssl_ca,
+				GloVars.global.gr_bootstrap_ssl_capath,
+				GloVars.global.gr_bootstrap_ssl_cipher
+			);
+		}
+
+		if (!mysql_real_connect(mysql, c_host, c_user, c_pass, nullptr, port, NULL, flags)) {
+			proxy_error("Bootstrap failed, connection error '%s'\n", mysql_error(mysql));
+			exit(EXIT_FAILURE);
+		}
+
+		if (uri_data.pass.empty()) {
+			uint32_t passlen = strlen(c_pass);
+			memset(static_cast<void*>(const_cast<char*>(c_pass)), 0, passlen);
+		}
+
+		// Get server default collation and version directly from initial handshake
+		bootstrap_info.server_language = mysql->server_language;
+		bootstrap_info.server_version = mysql->server_version;
+
+		// Fetch all required data for Bootstrap
+		int myrc = mysql_query(mysql, BOOTSTRAP_SELECT_SERVERS);
+
+		if (myrc) {
+			proxy_error("Bootstrap failed, query failed with error - %s\n", mysql_error(mysql));
+			exit(EXIT_FAILURE);
+		}
+
+		MYSQL_RES* myres_members = mysql_store_result(mysql);
+
+		if (myres_members == nullptr || mysql_num_rows(myres_members) == 0) {
+			proxy_error("Bootstrap failed, expected server %s:%d to have Group Replication configured\n", c_host, port);
+			exit(EXIT_FAILURE);
+		}
+
+		myrc = mysql_query(mysql, BOOTSTRAP_SELECT_USERS);
+
+		if (myrc) {
+			proxy_error("Bootstrap failed, query failed with error - %s\n", mysql_error(mysql));
+			exit(EXIT_FAILURE);
+		}
+
+		MYSQL_RES* myres_users = mysql_store_result(mysql);
+
+		if (myres_users == nullptr) {
+			proxy_error("Bootstrap failed, storing resultset failed with error - %s\n", mysql_error(mysql));
+			exit(EXIT_FAILURE);
+		}
+
+		// TODO-NOTE: Maybe further data verification should be performed here; bootstrap-info holding final types
+		bootstrap_info.servers = myres_members;
+		bootstrap_info.users = myres_users;
+
+		// Setup a bootstrap account - monitoring
+		const string account_create_policy {
+			GloVars.global.gr_bootstrap_account_create == nullptr ? "if-not-exists" :
+				GloVars.global.gr_bootstrap_account_create
+		};
+
+		if (GloVars.global.gr_bootstrap_account == nullptr && GloVars.global.gr_bootstrap_account_create != nullptr) {
+			proxy_error("Bootstrap failed, option '--account-create' can only be used in combination with '--account'\n");
+			exit(EXIT_FAILURE);
+		}
+
+		const uint32_t password_retries = GloVars.global.gr_bootstrap_password_retries;
+		string new_mon_user {};
+		string new_mon_pass {};
+
+		if (GloVars.global.gr_bootstrap_account != nullptr) {
+			const vector<string> valid_policies { "if-not-exists", "always", "never" };
+			if (std::find(valid_policies.begin(), valid_policies.end(), account_create_policy) == valid_policies.end()) {
+				proxy_error("Bootstrap failed, unknown '--account-create' option '%s'\n", account_create_policy.c_str());
+				exit(EXIT_FAILURE);
+			}
+
+			// Since an account has been specified, we require the password for the account
+			const string mon_user { GloVars.global.gr_bootstrap_account };
+			const string get_acc_pass_msg { "Please enter MySQL password for " + mon_user + ": " };
+
+			// Get the account pass directly from user input
+			const string mon_pass = getpass(get_acc_pass_msg.c_str());
+
+			// 1. Check if account exists
+			const string get_user_cnt { "SELECT COUNT(*) FROM mysql.user WHERE user='" + mon_user + "'" };
+			int cnt_err = mysql_query(mysql, get_user_cnt.c_str());
+			MYSQL_RES* myres = mysql_store_result(mysql);
+
+			if (cnt_err || myres == nullptr) {
+				proxy_error("Bootstrap failed, detecting count existence failed with error - %s\n", mysql_error(mysql));
+				exit(EXIT_FAILURE);
+			}
+
+			MYSQL_ROW myrow = mysql_fetch_row(myres);
+			uint32_t acc_exists = atoi(myrow[0]);
+			mysql_free_result(myres);
+
+			if (account_create_policy == "if-not-exists") {
+				// 2. Account doesn't exists, create new account. Otherwise reuse current
+				if (acc_exists == 0) {
+					pair<int32_t,acct_creds_t> new_creds { create_bootstrap_account(mysql, mon_user, mon_pass) };
+
+					if (new_creds.first) {
+						proxy_error("Bootstrap failed, user creation failed with error - %s\n", mysql_error(mysql));
+						exit(EXIT_FAILURE);
+					} {
+						// Store the credentials as the new 'monitor' ones.
+						new_mon_user = mon_user;
+						new_mon_pass = new_creds.second.pass;
+					}
+				} else {
+					new_mon_user = mon_user;
+					new_mon_pass = mon_pass;
+				}
+			} else if (account_create_policy == "always") {
+				if (acc_exists == 0) {
+					pair<int32_t,acct_creds_t> new_creds { create_bootstrap_account(mysql, mon_user, mon_pass) };
+
+					if (new_creds.first) {
+						proxy_error("Bootstrap failed, user creation failed with error - %s\n", mysql_error(mysql));
+						exit(EXIT_FAILURE);
+					}
+				} else {
+					proxy_error(
+						"Bootstrap failed, account '%s' already exists but supplied option '--account-create=\"always\"'\n",
+						mon_user.c_str()
+					);
+					exit(EXIT_FAILURE);
+				}
+
+				new_mon_user = mon_user;
+				new_mon_pass = mon_pass;
+			} else if (account_create_policy == "never") {
+				if (acc_exists == 0) {
+					proxy_error(
+						"Bootstrap failed, account '%s' doesn't exists but supplied option '--account-create=\"never\"'\n",
+						mon_user.c_str()
+					);
+					exit(EXIT_FAILURE);
+				}
+
+				new_mon_user = mon_user;
+				new_mon_pass = mon_pass;
+			} else {
+				proxy_error("Bootstrap failed, unknown '--account-create' option '%s'\n", account_create_policy.c_str());
+				exit(EXIT_FAILURE);
+			}
+		} else {
+			string prev_bootstrap_user {};
+			string prev_bootstrap_pass {};
+
+			if (Proxy_file_exists(GloVars.admindb)) {
+				SQLite3DB::LoadPlugin(GloVars.sqlite3_plugin);
+				SQLite3DB* configdb = new SQLite3DB();
+				configdb->open((char*)GloVars.admindb, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX);
+
+				{
+					const char check_table[] {
+						"SELECT count(*) FROM sqlite_master WHERE type='table' AND name='bootstrap_variables'"
+					};
+
+					int table_exists = 0;
+
+					char* error = nullptr;
+					int cols = 0;
+					int affected_rows = 0;
+					SQLite3_result* resultset = NULL;
+
+					configdb->execute_statement(check_table, &error , &cols , &affected_rows , &resultset);
+
+					if (error == nullptr && resultset) {
+						table_exists = atoi(resultset->rows[0]->fields[0]);
+						delete resultset;
+					} else {
+						const char* err_msg = error != nullptr ? error : "Empty resultset";
+						proxy_error("Bootstrap failed, query failed with error - %s", err_msg);
+						exit(EXIT_FAILURE);
+					}
+
+					if (table_exists != 0) {
+						const char query_user_pass[] {
+							"SELECT variable_name,variable_value FROM bootstrap_variables"
+								" WHERE variable_name='bootstrap_username' OR variable_name='bootstrap_password'"
+								" ORDER BY variable_name"
+						};
+						configdb->execute_statement(query_user_pass, &error, &cols, &affected_rows, &resultset);
+
+						if (resultset->rows.size() != 0) {
+							prev_bootstrap_user = resultset->rows[1]->fields[1];
+							prev_bootstrap_pass = resultset->rows[0]->fields[1];
+						}
+
+						if (resultset) {
+							delete resultset;
+						}
+					}
+				}
+
+				delete configdb;
+			}
+
+			if (!prev_bootstrap_pass.empty() && !prev_bootstrap_user.empty()) {
+				proxy_info(
+					"Bootstrap info, detected previous bootstrap user '%s' reusing account...\n",
+					prev_bootstrap_user.c_str()
+				);
+
+				new_mon_user = prev_bootstrap_user;
+				new_mon_pass = prev_bootstrap_pass;
+			} else {
+				// Create random account with random password
+				pair<int32_t,acct_creds_t> mon_creds { create_random_bootstrap_account(mysql, password_retries) };
+
+				if (mon_creds.first) {
+					proxy_error(
+						"Bootstrap failed, user creation '%s' failed with error - %s\n",
+						mon_creds.second.user.c_str(), mysql_error(mysql)
+					);
+					exit(EXIT_FAILURE);
+				} else {
+					new_mon_user = mon_creds.second.user;
+					new_mon_pass = mon_creds.second.pass;
+					bootstrap_info.rand_gen_user = true;
+				}
+			}
+		}
+
+		bootstrap_info.mon_user = new_mon_user;
+		bootstrap_info.mon_pass = new_mon_pass;
+
+		mysql_close(mysql);
 	}
 
 	{
@@ -1434,47 +2384,9 @@ int main(int argc, const char * argv[]) {
 #endif
 		}
 
-	laststart=0;
-	if (glovars.proxy_restart_on_error) {
-gotofork:
-		if (laststart) {
-			int currenttime=time(NULL);
-			if (currenttime == laststart) { /// we do not want to restart multiple times in the same second
-				// if restart is too frequent, something really bad is going on
-				//daemon_log(LOG_INFO, "Angel process is waiting %d seconds before starting a new ProxySQL process\n", glovars.proxy_restart_delay);
-				parent_open_error_log();
-				proxy_info("Angel process is waiting %d seconds before starting a new ProxySQL process\n", glovars.proxy_restart_delay);
-				parent_close_error_log();
-				sleep(glovars.proxy_restart_delay);
-			}
+		if (glovars.proxy_restart_on_error) {
+			handleProcessRestart();
 		}
-		laststart=time(NULL);
-		pid = fork();
-		if (pid < 0) {
-			//daemon_log(LOG_INFO, "[FATAL]: Error in fork()\n");
-			parent_open_error_log();
-			proxy_error("[FATAL]: Error in fork()\n");
-			exit(EXIT_FAILURE);
-		}
-
-		if (pid) { /* The parent */
-
-			parent_close_error_log();
-			if (ProxySQL_daemonize_phase3()==false) {
-				goto gotofork;
-			}
-
-		} else { /* The daemon */
-
-			// we open the files also on the child process
-			// this is required if the child process was created after a crash
-			parent_open_error_log();
-			GloVars.global.start_time=monotonic_time();
-			GloVars.install_signal_handler();
-		}
-	}
-
-
 
 	} else {
 		GloAdmin->flush_error_log();
@@ -1482,10 +2394,9 @@ gotofork:
 	}
 
 __start_label:
-
 	{
 		cpu_timer t;
-		ProxySQL_Main_init_phase2___not_started();
+		ProxySQL_Main_init_phase2___not_started(bootstrap_info);
 #ifdef DEBUG
 		std::cerr << "Main init phase2 completed in ";
 #endif
@@ -1510,6 +2421,15 @@ __start_label:
 	proxy_info("For consultancy visit: https://proxysql.com/services/consulting/\n");
 
 	{
+#if 0
+		{
+			// the following commented code is here only to manually test handleProcessRestart()
+			// DO NOT ENABLE
+			//proxy_info("Service is up\n");
+			//sleep(2);
+			//assert(0);
+		}
+#endif
 		unsigned int missed_heartbeats = 0;
 		unsigned long long previous_time = monotonic_time();
 		unsigned int inner_loops = 0;
@@ -1585,11 +2505,15 @@ __start_label:
 					proxy_error("Watchdog: %u threads missed a heartbeat\n", threads_missing_heartbeat);
 					missed_heartbeats++;
 					if (missed_heartbeats >= (unsigned int)GloVars.restart_on_missing_heartbeats) {
+#ifdef RUNNING_ON_VALGRIND
+						proxy_error("Watchdog: reached %u missed heartbeats. Not aborting because running under Valgrind\n", missed_heartbeats);
+#else
 						if (GloVars.restart_on_missing_heartbeats) {
 							proxy_error("Watchdog: reached %u missed heartbeats. Aborting!\n", missed_heartbeats);
 							proxy_error("Watchdog: see details at https://github.com/sysown/proxysql/wiki/Watchdog\n");
 							assert(0);
 						}
+#endif
 					}
 				} else {
 					missed_heartbeats = 0;

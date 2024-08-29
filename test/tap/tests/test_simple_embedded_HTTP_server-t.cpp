@@ -6,10 +6,10 @@
 #include <vector>
 #include <tuple>
 
-#include <curl/curl.h>
+#include "curl/curl.h"
 
-#include <mysql.h>
-#include <mysql/mysqld_error.h>
+#include "mysql.h"
+#include "mysqld_error.h"
 
 #include "tap.h"
 #include "command_line.h"

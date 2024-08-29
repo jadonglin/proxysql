@@ -8,38 +8,41 @@
 #include "MySQL_PreparedStatement.h"
 #include "MySQL_Data_Stream.h"
 
-#include <openssl/x509v3.h>
+#include "openssl/x509v3.h"
 
-/*
-
-in libssl 1.1.0 
-struct bio_st {
-	const BIO_METHOD *method;
-	long (*callback) (struct bio_st *, int, const char *, int, long, long);
-	char *cb_arg;
-	int init;
-	int shutdown;
-	int flags;
-	int retry_reason;
-	int num;
-	void *ptr;
-	struct bio_st *next_bio;
-	struct bio_st *prev_bio;
-	int references;
-	uint64_t num_read;
-	uint64_t num_write;
-	CRYPTO_EX_DATA ex_data;
-	CRYPTO_RWLOCK *lock;
-};
-*/
-
-typedef int CRYPTO_REF_COUNT;
 
 /**
- * @brief This is the 'bio_st' struct definition from libssl 3.0.0. NOTE: This is an internal struct from
+ * @brief This is the 'bio_st' struct definition from libssl. NOTE: This is an internal struct from
  *   OpenSSL library, currently it's used for performing checks on the reads/writes performed on the BIO objects.
  *   It's extremely important to keep this struct up to date with each OpenSSL dependency update.
  */
+typedef int CRYPTO_REF_COUNT;
+
+#if (OPENSSL_VERSION_NUMBER & 0xFFFF0000) == 0x10100000
+#pragma message "libssl 1.1.x detected"
+struct bio_st {
+    const BIO_METHOD *method;
+    /* bio, mode, argp, argi, argl, ret */
+    BIO_callback_fn callback;
+    BIO_callback_fn_ex callback_ex;
+    char *cb_arg;               /* first argument for the callback */
+    int init;
+    int shutdown;
+    int flags;                  /* extra storage */
+    int retry_reason;
+    int num;
+    void *ptr;
+    struct bio_st *next_bio;    /* used by filter BIOs */
+    struct bio_st *prev_bio;    /* used by filter BIOs */
+    CRYPTO_REF_COUNT references;
+    uint64_t num_read;
+    uint64_t num_write;
+    CRYPTO_EX_DATA ex_data;
+    CRYPTO_RWLOCK *lock;
+};
+
+#elif (OPENSSL_VERSION_NUMBER & 0xFFFF0000) == 0x30000000 || (OPENSSL_VERSION_NUMBER & 0xFFFF0000) == 0x30100000
+#pragma message "libssl 3.0.x / 3.1.x detected"
 struct bio_st {
     OSSL_LIB_CTX *libctx;
     const BIO_METHOD *method;
@@ -63,6 +66,35 @@ struct bio_st {
     CRYPTO_EX_DATA ex_data;
     CRYPTO_RWLOCK *lock;
 };
+
+#elif (OPENSSL_VERSION_NUMBER & 0xFFFF0000) == 0x30200000 || (OPENSSL_VERSION_NUMBER & 0xFFFF0000) == 0x30300000
+#pragma message "libssl 3.2.x / 3.3.x detected"
+struct bio_st {
+    OSSL_LIB_CTX *libctx;
+    const BIO_METHOD *method;
+    /* bio, mode, argp, argi, argl, ret */
+#ifndef OPENSSL_NO_DEPRECATED_3_0
+    BIO_callback_fn callback;
+#endif
+    BIO_callback_fn_ex callback_ex;
+    char *cb_arg;               /* first argument for the callback */
+    int init;
+    int shutdown;
+    int flags;                  /* extra storage */
+    int retry_reason;
+    int num;
+    void *ptr;
+    struct bio_st *next_bio;    /* used by filter BIOs */
+    struct bio_st *prev_bio;    /* used by filter BIOs */
+    CRYPTO_REF_COUNT references;
+    uint64_t num_read;
+    uint64_t num_write;
+    CRYPTO_EX_DATA ex_data;
+};
+
+#else
+#error "libssl version not supported: OPENSSL_VERSION_NUMBER = " ##OPENSSL_VERSION_NUMBER
+#endif
 
 
 #define RESULTSET_BUFLEN_DS_16K 16000
@@ -118,7 +150,9 @@ static void __dump_pkt(const char *func, unsigned char *_ptr, unsigned int len) 
 }
 
 #define queue_zero(_q) { \
-  memcpy(_q.buffer, (unsigned char *)_q.buffer + _q.tail, _q.head - _q.tail); \
+  if (_q.tail != 0) { \
+    memcpy(_q.buffer, (unsigned char *)_q.buffer + _q.tail, _q.head - _q.tail); \
+  } \
   _q.head-=_q.tail; \
   _q.tail=0; \
 }
@@ -139,8 +173,23 @@ static void __dump_pkt(const char *func, unsigned char *_ptr, unsigned int len) 
 #define queue_r_ptr(_q) ((unsigned char *)_q.buffer+_q.tail)
 #define queue_w_ptr(_q) ((unsigned char *)_q.buffer+_q.head)
 
+#define add_to_data_packet_history(_o,_p,_s) if (unlikely(GloVars.global.data_packets_history_size)) { \
+	if (static_cast<int>(_o.get_max_size()) != GloVars.global.data_packets_history_size) { \
+		_o.set_max_size(GloVars.global.data_packets_history_size); \
+	} \
+	_o.push(_p,_s);\
+}
 
-
+// memory deallocation responsibility is now transferred to the queue as the buffer is directly assigned to it. 
+// if the size of data_packet_history is 0, the memory will be released.
+#define add_to_data_packet_history_without_alloc(_o,_p,_s) if (unlikely(GloVars.global.data_packets_history_size)) { \
+	if (static_cast<int>(_o.get_max_size()) != GloVars.global.data_packets_history_size) { \
+		_o.set_max_size(GloVars.global.data_packets_history_size); \
+	} \
+	_o.push<false>(_p,_s);\
+} else { \
+	l_free(_s,_p); \
+}
 //enum sslstatus { SSLSTATUS_OK, SSLSTATUS_WANT_IO, SSLSTATUS_FAIL};
 
 static enum sslstatus get_sslstatus(SSL* ssl, int n)
@@ -198,6 +247,9 @@ enum sslstatus MySQL_Data_Stream::do_ssl_handshake() {
 					}
 				}
 			}
+
+			sk_GENERAL_NAME_pop_free(alt_names, GENERAL_NAME_free);
+			X509_free(cert);
 		} else {
 			// we currently disable this annoying error
 			// in future we can configure this as per user level, specifying if the certificate is mandatory or not
@@ -209,7 +261,7 @@ enum sslstatus MySQL_Data_Stream::do_ssl_handshake() {
 		if (x509_subject_alt_name != NULL) {
 			long rc = SSL_get_verify_result(ssl);
 			if (rc != X509_V_OK) {
-				proxy_error("Disconnecting %s:%d: X509 client SSL certificate verify error: (%d:%s)\n" , addr.addr, addr.port, rc, X509_verify_cert_error_string(rc));
+				proxy_error("Disconnecting %s:%d: X509 client SSL certificate verify error: (%ld:%s)\n" , addr.addr, addr.port, rc, X509_verify_cert_error_string(rc));
 				return SSLSTATUS_FAIL;
 			}
 		}
@@ -285,7 +337,9 @@ MySQL_Data_Stream::MySQL_Data_Stream() {
 	DSS=STATE_NOT_CONNECTED;
 	encrypted=false;
 	switching_auth_stage = 0;
-	switching_auth_type = 0;
+	switching_auth_type = AUTH_UNKNOWN_PLUGIN;
+	switching_auth_sent = AUTH_UNKNOWN_PLUGIN;
+	auth_in_progress = 0;
 	x509_subject_alt_name=NULL;
 	ssl=NULL;
 	rbio_ssl = NULL;
@@ -379,18 +433,10 @@ MySQL_Data_Stream::~MySQL_Data_Stream() {
 			// other part, we perform a 'quiet' shutdown. For more context see
 			// MYSQL #29579.
 			SSL_set_quiet_shutdown(ssl, 1);
-			SSL_shutdown(ssl);
+			if (SSL_shutdown(ssl) < 0)
+				ERR_clear_error();
 		}
 		if (ssl) SSL_free(ssl);
-/*
-		SSL_free() should also take care of these
-		if (rbio_ssl) {
-			BIO_free(rbio_ssl);
-		}
-		if (wbio_ssl) {
-			BIO_free(wbio_ssl);
-		}
-*/
 	}
 	if (multi_pkt.ptr) {
 		l_free(multi_pkt.size,multi_pkt.ptr);
@@ -421,6 +467,11 @@ void MySQL_Data_Stream::init() {
 		if (PSarrayOUT==NULL) PSarrayOUT= new PtrSizeArray();
 //		if (PSarrayOUTpending==NULL) PSarrayOUTpending= new PtrSizeArray();
 		if (resultset==NULL) resultset = new PtrSizeArray();
+
+		if (unlikely(GloVars.global.data_packets_history_size)) {
+			data_packets_history_IN.set_max_size(GloVars.global.data_packets_history_size);
+			data_packets_history_OUT.set_max_size(GloVars.global.data_packets_history_size);
+		}
 	}
 	if (myds_type!=MYDS_FRONTEND) {
 		queue_destroy(queueIN);
@@ -465,7 +516,8 @@ void MySQL_Data_Stream::shut_hard() {
 		// other part, we perform a 'quiet' shutdown. For more context see
 		// MYSQL #29579.
 		SSL_set_quiet_shutdown(ssl, 1);
-		SSL_shutdown(ssl);
+		if (SSL_shutdown(ssl) < 0)
+			ERR_clear_error();
 	}
 	if (fd >= 0) {
 		shutdown(fd, SHUT_RDWR);
@@ -479,6 +531,7 @@ void MySQL_Data_Stream::check_data_flow() {
 		// there is data at both sides of the data stream: this is considered a fatal error
 		proxy_error("Session=%p, DataStream=%p -- Data at both ends of a MySQL data stream: IN <%d bytes %d packets> , OUT <%d bytes %d packets>\n", sess, this, PSarrayIN->len , queue_data(queueIN) , PSarrayOUT->len , queue_data(queueOUT));
 		shut_soft();
+		generate_coredump();
 	}
 	if ((myds_type==MYDS_BACKEND) && myconn && (myconn->fd==0) && (revents & POLLOUT)) {
 		int rc;
@@ -500,17 +553,24 @@ int MySQL_Data_Stream::read_from_net() {
 	if (encrypted) {
 		//proxy_info("Entering\n");
 	}
-	if ((revents & POLLIN)==0) return 0;
-	if (revents & POLLHUP) {
+	if ( (revents & POLLHUP) && ((revents & POLLIN)==0) ) {
+		// Previously this was (revents & POLLHUP) , but now
+		// we call shut_soft() only if POLLIN is not set .
+		//
+		// This means that if we receive data (POLLIN) we process it
+		// temporarily ignoring POLLHUP .
+		// In this way we can intercept a COM_QUIT executed by the client
+		// before closing the socket
 		shut_soft();
 		return -1;
 	}
+	// this check was moved after the previous one about POLLHUP,
+	// otherwise the previous check was never true
+	if ((revents & POLLIN)==0) return 0;
 
 	int r=0;
 	int s=queue_available(queueIN);
-	if (encrypted) {
-	//	proxy_info("Queue available of %d bytes\n", s);
-	}
+
 	if (encrypted == false) {
 		if (pkts_recv) {
 			r = recv(fd, queue_w_ptr(queueIN), s, 0);
@@ -529,42 +589,25 @@ int MySQL_Data_Stream::read_from_net() {
 				r = recv(fd, queue_w_ptr(queueIN), s, 0);
 			}
 		}
-	} else {
-/*
-		if (!SSL_is_init_finished(ssl)) {
-			int ret = SSL_do_handshake(ssl);
-			int ret2;
-			if (ret != 1) {
-				//ERR_print_errors_fp(stderr);
-				ret2 = SSL_get_error(ssl, ret);
-				fprintf(stderr,"%d\n",ret2);
-			}
-			return 0;
-		} else {
-			r = SSL_read (ssl, queue_w_ptr(queueIN), s);
-		}
-*/
+	} else { // encrypted == true
 		PROXY_TRACE();
 		if (s < MY_SSL_BUFFER) {
 			return 0;	// no enough space for reads
 		}
 		char buf[MY_SSL_BUFFER];
-		//ssize_t n = read(fd, buf, sizeof(buf));
-		int n = recv(fd, buf, sizeof(buf), 0);
-		//proxy_info("SSL recv of %d bytes\n", n);
-		proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p: recv() read %d bytes. num_write: %u ,  num_read: %u\n", sess, n,  rbio_ssl->num_write , rbio_ssl->num_read);
-		if (n > 0 || rbio_ssl->num_write > rbio_ssl->num_read) {
-			//on_read_cb(buf, (size_t)n);
+		int ssl_recv_bytes = recv(fd, buf, sizeof(buf), 0);
+		proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p: recv() read %d bytes. num_write: %lu ,  num_read: %lu\n", sess, ssl_recv_bytes,  rbio_ssl->num_write , rbio_ssl->num_read);
 
+		if (ssl_recv_bytes > 0 || rbio_ssl->num_write > rbio_ssl->num_read) {
 			char buf2[MY_SSL_BUFFER];
 			int n2;
 			enum sslstatus status;
 			char *src = buf;
-			int len = n;
+			int len = ssl_recv_bytes;
 			while (len > 0) {
 				n2 = BIO_write(rbio_ssl, src, len);
 				proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p: write %d bytes into BIO %p, len=%d\n", sess, n2, rbio_ssl, len);
-				//proxy_info("BIO_write with len = %d and %d bytes\n", len , n2);
+
 				if (n2 <= 0) {
 					shut_soft();
 					return -1;
@@ -572,40 +615,29 @@ int MySQL_Data_Stream::read_from_net() {
 				src += n2;
 				len -= n2;
 				if (!SSL_is_init_finished(ssl)) {
-					//proxy_info("SSL_is_init_finished NOT completed\n");
+					proxy_debug(PROXY_DEBUG_NET, 5, "SSL handshake not finished yet   session=%p bytes=%d BIO=%p len=%d\n", sess, n2, rbio_ssl, len);
 					if (do_ssl_handshake() == SSLSTATUS_FAIL) {
-						//proxy_info("SSL_is_init_finished failed!!\n");
+						proxy_debug(PROXY_DEBUG_NET, 5, "SSL handshake failed   session=%p bytes=%d BIO=%p len=%d\n", sess, n2, rbio_ssl, len);
 						shut_soft();
 						return -1;
 					}
 					if (!SSL_is_init_finished(ssl)) {
-						//proxy_info("SSL_is_init_finished yet NOT completed\n");
+						proxy_debug(PROXY_DEBUG_NET, 5, "SSL handshake not finished yet   session=%p bytes=%d BIO=%p len=%d\n", sess, n2, rbio_ssl, len);
 						return 0;
 					}
 				} else {
-					//proxy_info("SSL_is_init_finished completed\n");
+					proxy_debug(PROXY_DEBUG_NET, 5, "SSL handshake finished   session=%p bytes=%d BIO=%p len=%d\n", sess, n2, rbio_ssl, len);
 				}
 			}
 			n2 = SSL_read (ssl, queue_w_ptr(queueIN), s);
 			proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p: read %d bytes from BIO %p into a buffer with %d bytes free\n", sess, n2, rbio_ssl, s);
 			r = n2;
-			//proxy_info("Read %d bytes from SSL\n", r);
-			if (n2 > 0) {
-			}
-/*
-			do {
-				n2 = SSL_read(ssl, buf2, sizeof(buf2));
-				if (n2 > 0) {
-					
-				}
-			} while (n > 0);
-*/
 			status = get_sslstatus(ssl, n2);
-			//proxy_info("SSL status = %d\n", status);
+
 			if (status == SSLSTATUS_WANT_IO) {
 				do {
 					n2 = BIO_read(wbio_ssl, buf2, sizeof(buf2));
-					//proxy_info("BIO_read with %d bytes\n", n2);
+
 					if (n2 > 0) {
           				queue_encrypted_bytes(buf2, n2);
 					} else if (!BIO_should_retry(wbio_ssl)) {
@@ -619,14 +651,18 @@ int MySQL_Data_Stream::read_from_net() {
 				return -1;
 			}
 		} else {
-			r = n;
-			//r += SSL_read (ssl, queue_w_ptr(queueIN), s);
-			//proxy_info("Read %d bytes from SSL\n", r);
+			// Shutdown if we either received the EOF, or operation failed with non-retryable error.
+			if (ssl_recv_bytes==0 || (ssl_recv_bytes==-1 && errno != EINTR && errno != EAGAIN)) {
+				proxy_debug(PROXY_DEBUG_NET, 5, "Received EOF, shutting down soft socket -- Session=%p, Datastream=%p\n", sess, this);
+				shut_soft();
+				return -1;
+			}
+			r = ssl_recv_bytes;
 		}
 	}
-//__exit_read_from_next:
+
 	proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p: read %d bytes from fd %d into a buffer of %d bytes free\n", sess, r, fd, s);
-	//proxy_error("read %d bytes from fd %d into a buffer of %d bytes free\n", r, fd, s);
+
 	if (r < 1) {
 		if (encrypted==false) {
 			int myds_errno=errno;
@@ -635,12 +671,36 @@ int MySQL_Data_Stream::read_from_net() {
 			}
 		} else {
 			int ssl_ret=SSL_get_error(ssl, r);
-			if (ssl_ret!=SSL_ERROR_WANT_READ && ssl_ret!=SSL_ERROR_WANT_WRITE) shut_soft();
-			if (r==0 && revents==1) {
-				// revents returns 1 , but recv() returns 0 , so there is no data.
-				// Therefore the socket is already closed
-				shut_soft();
+			proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p, Datastream=%p -- session_id: %u , SSL_get_error(): %d , errno: %d\n", sess, this, sess->thread_session_id, ssl_ret, errno);
+			const int st = ERR_get_error();
+			if (
+				(ssl_ret == SSL_ERROR_SYSCALL) &&
+				(
+					((errno == EINTR || errno == EAGAIN))
+					|| (st == 0)
+				)
+			) {
+				// the read was interrupted, do nothing
+				proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p, Datastream=%p -- SSL_get_error() is SSL_ERROR_SYSCALL, errno: %d, ERR_get_error=%d\n", sess, this, errno, st);
+			} else {
+				if (r==0) { // we couldn't read any data
+					if (revents & POLLIN) {
+						// If revents is holding either POLLIN, or POLLIN and POLLHUP, but 'recv()' returns 0,
+						// reading no data, the socket has been already closed by the peer. Due to this we can
+						// ignore POLLHUP in this check, since we should reach here ONLY if POLLIN was set.
+						proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p, Datastream=%p -- shutdown soft\n", sess, this);
+						shut_soft();
+					}
+				}
+				if (ssl_ret!=SSL_ERROR_WANT_READ && ssl_ret!=SSL_ERROR_WANT_WRITE) shut_soft();
+				// it seems we end in shut_soft() anyway
 			}
+		}
+		if ( (revents & POLLHUP) ) {
+			// this is a final check
+			// Only if the amount of data read is 0 or less, then we check POLLHUP
+			proxy_debug(PROXY_DEBUG_NET, 5, "Session=%p, Datastream=%p -- shutdown soft. revents=%d , bytes read = %d\n", sess, this, revents, r);
+			shut_soft();
 		}
 	} else {
 		queue_w(queueIN,r);
@@ -670,11 +730,13 @@ int MySQL_Data_Stream::write_to_net() {
 	if (encrypted) {
 		bytes_io = SSL_write (ssl, queue_r_ptr(queueOUT), s);
 		//proxy_info("Used SSL_write to write %d bytes\n", bytes_io);
+		proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p, Datastream=%p: SSL_write() wrote %d bytes . queueOUT before: %u\n", sess, this, bytes_io, queue_data(queueOUT));
 		if (ssl_write_len || wbio_ssl->num_write > wbio_ssl->num_read) {
 			//proxy_info("ssl_write_len = %d , num_write = %d , num_read = %d\n", ssl_write_len , wbio_ssl->num_write , wbio_ssl->num_read);
 			char buf[MY_SSL_BUFFER];
 			do {
 				n = BIO_read(wbio_ssl, buf, sizeof(buf));
+				proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p, Datastream=%p: BIO_read() read %d bytes\n", sess, this, n);
 				//proxy_info("BIO read = %d\n", n);
 				if (n > 0) {
 					//proxy_info("Setting %d byte in queue encrypted\n", n);
@@ -687,15 +749,22 @@ int MySQL_Data_Stream::write_to_net() {
 				}
 			} while (n>0);
 		}
+		proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p, Datastream=%p: current ssl_write_len is %lu bytes\n", sess, this, ssl_write_len);
 		if (ssl_write_len) {
 			n = write(fd, ssl_write_buf, ssl_write_len);
+			proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p, Datastream=%p: write() wrote %d bytes in FD %d\n", sess, this, n, fd);
 			//proxy_info("Calling write() on SSL: %d\n", n);
 			if (n>0) {
 				if ((size_t)n < ssl_write_len) {
 					memmove(ssl_write_buf, ssl_write_buf+n, ssl_write_len-n);
 				}
 				ssl_write_len -= n;
-    			ssl_write_buf = (char*)realloc(ssl_write_buf, ssl_write_len);
+				if (ssl_write_len) {
+					ssl_write_buf = (char*)realloc(ssl_write_buf, ssl_write_len);
+				} else {
+					free(ssl_write_buf);
+					ssl_write_buf = NULL;
+				}
 				//proxy_info("new ssl_write_len: %u\n", ssl_write_len);
 				//if (ssl_write_len) {
     			//	return n; // stop here
@@ -719,6 +788,7 @@ int MySQL_Data_Stream::write_to_net() {
 #else
 		bytes_io = send(fd, queue_r_ptr(queueOUT), s, MSG_NOSIGNAL);
 #endif
+		proxy_debug(PROXY_DEBUG_NET, 7, "Session=%p, Datastream=%p: send() wrote %d bytes in FD %d\n", sess, this, bytes_io, fd);
 	}
 	if (encrypted) {
 		//proxy_info("bytes_io: %d\n", bytes_io);
@@ -845,7 +915,12 @@ int MySQL_Data_Stream::write_to_net_poll() {
 					memmove(ssl_write_buf, ssl_write_buf+n, ssl_write_len-n);
 				}
 				ssl_write_len -= n;
-    			ssl_write_buf = (char*)realloc(ssl_write_buf, ssl_write_len);
+				if (ssl_write_len) {
+					ssl_write_buf = (char*)realloc(ssl_write_buf, ssl_write_len);
+				} else {
+					free(ssl_write_buf);
+					ssl_write_buf = NULL;
+				}
 				//proxy_info("new ssl_write_len: %u\n", ssl_write_len);
 				if (ssl_write_len) {
     				return n; // stop here
@@ -903,10 +978,12 @@ int MySQL_Data_Stream::read_pkts() {
 int MySQL_Data_Stream::buffer2array() {
 	int ret=0;
 	bool fast_mode=sess->session_fast_forward;
-	int s = queue_data(queueIN);
-	if (s==0) return ret;
-	if ((queueIN.pkt.size==0) && s<sizeof(mysql_hdr)) {
-		queue_zero(queueIN);
+	{
+		unsigned long s = queue_data(queueIN);
+		if (s==0) return ret;
+		if ((queueIN.pkt.size==0) && s<sizeof(mysql_hdr)) {
+			queue_zero(queueIN);
+		}
 	}
 
 	if (fast_mode) {
@@ -919,6 +996,7 @@ int MySQL_Data_Stream::buffer2array() {
 			memcpy(queueIN.pkt.ptr, queue_r_ptr(queueIN) , queueIN.pkt.size);
 			queue_r(queueIN, queueIN.pkt.size);
 			PSarrayIN->add(queueIN.pkt.ptr,queueIN.pkt.size);
+			add_to_data_packet_history(data_packets_history_IN,queueIN.pkt.ptr,queueIN.pkt.size);
 			queueIN.pkt.ptr = NULL;
 		} else {
 			if (PSarrayIN->len == 0) {
@@ -929,6 +1007,7 @@ int MySQL_Data_Stream::buffer2array() {
 				memcpy(queueIN.pkt.ptr, queue_r_ptr(queueIN) , queueIN.pkt.size);
 				queue_r(queueIN, queueIN.pkt.size);
 				PSarrayIN->add(queueIN.pkt.ptr,queueIN.pkt.size);
+				add_to_data_packet_history(data_packets_history_IN,queueIN.pkt.ptr,queueIN.pkt.size);
 				queueIN.pkt.ptr = NULL;
 			} else {
 				// get a pointer to the last entry in PSarrayIN
@@ -941,6 +1020,7 @@ int MySQL_Data_Stream::buffer2array() {
 					memcpy(queueIN.pkt.ptr, queue_r_ptr(queueIN) , queueIN.pkt.size);
 					queue_r(queueIN, queueIN.pkt.size);
 					PSarrayIN->add(queueIN.pkt.ptr,queueIN.pkt.size);
+					add_to_data_packet_history(data_packets_history_IN,queueIN.pkt.ptr,queueIN.pkt.size);
 					queueIN.pkt.ptr = NULL;
 				} else {
 					// we append the packet at the end of the previous packet
@@ -1077,9 +1157,13 @@ int MySQL_Data_Stream::buffer2array() {
 					if ((datalength-progress) >= (CompPktIN.pkt.size-CompPktIN.partial)) {
 						// we can copy till the end of the packet
 						memcpy((char *)CompPktIN.pkt.ptr + CompPktIN.partial , _ptr+progress, CompPktIN.pkt.size - CompPktIN.partial);
-						CompPktIN.partial=0;
+						// 'progress' is required to be updated with the actual copied size to the target packet. This
+						// is, taking into account the already copied data, 'CompPktIN.partial', otherwise, in case of
+						// split packets, we could jump over the remaining unprocessed data.
 						progress+= CompPktIN.pkt.size - CompPktIN.partial;
 						PSarrayIN->add(CompPktIN.pkt.ptr, CompPktIN.pkt.size);
+						// Reset partial after full packet datalength has been processed
+						CompPktIN.partial=0;
 						CompPktIN.pkt.ptr=NULL; // sanity
 					} else {
 						// not enough data for the whole packet
@@ -1099,6 +1183,7 @@ int MySQL_Data_Stream::buffer2array() {
 			queueIN.pkt.ptr=NULL;
 		} else {
 			PSarrayIN->add(queueIN.pkt.ptr,queueIN.pkt.size);
+			add_to_data_packet_history(data_packets_history_IN,queueIN.pkt.ptr,queueIN.pkt.size);
 			pkts_recv++;
 			queueIN.pkt.size=0;
 			queueIN.pkt.ptr=NULL;
@@ -1219,7 +1304,8 @@ int MySQL_Data_Stream::array2buffer() {
 			if (PSarrayOUT->len-idx) {
 				proxy_debug(PROXY_DEBUG_PKT_ARRAY, 5, "Session=%p . DataStream: %p -- Removing a packet from array\n", sess, this);
 				if (queueOUT.pkt.ptr) {
-					l_free(queueOUT.pkt.size,queueOUT.pkt.ptr);
+					//l_free(queueOUT.pkt.size,queueOUT.pkt.ptr);
+					add_to_data_packet_history_without_alloc(data_packets_history_OUT,queueOUT.pkt.ptr,queueOUT.pkt.size);
 					queueOUT.pkt.ptr=NULL;
 				}
 		//VALGRIND_ENABLE_ERROR_REPORTING;
@@ -1231,8 +1317,16 @@ int MySQL_Data_Stream::array2buffer() {
 					memcpy(&queueOUT.pkt,PSarrayOUT->index(idx), sizeof(PtrSize_t));
 					idx++;
 		//VALGRIND_ENABLE_ERROR_REPORTING;
-					// this is a special case, needed because compression is enabled *after* the first OK
-					if (DSS==STATE_CLIENT_AUTH_OK) {
+					// This is a special case, needed because compression is enabled *after* the first OK. In
+					// case of 'caching_sha2_password', not only the first packet needs to be processed, since
+					// there are other scenarios in which one extra byte is sent prior to the final OK packet
+					// flagging auth success. The generation of these extra packets should all be queued at
+					// the same time, since they represent the final client response. Right now this is
+					// handled during 'MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE'.
+					// Because of this, we can make the assumption that once we have sent all the packets
+					// currently in 'PSarrayOUT', it's safe to change the 'DSS' status, and enable compression
+					// if connections requires it.
+					if (DSS==STATE_CLIENT_AUTH_OK && idx == PSarrayOUT->len) {
 						DSS=STATE_SLEEP;
 						// enable compression
 						if (myconn->options.server_capabilities & CLIENT_COMPRESS) {
@@ -1264,7 +1358,8 @@ int MySQL_Data_Stream::array2buffer() {
 		ret=b;
 		if (queueOUT.partial==queueOUT.pkt.size) {
 			if (queueOUT.pkt.ptr) {
-				l_free(queueOUT.pkt.size,queueOUT.pkt.ptr);
+				//l_free(queueOUT.pkt.size,queueOUT.pkt.ptr);
+				add_to_data_packet_history_without_alloc(data_packets_history_OUT,queueOUT.pkt.ptr,queueOUT.pkt.size);
 				queueOUT.pkt.ptr=NULL;
 			}
 			proxy_debug(PROXY_DEBUG_PKT_ARRAY, 5, "Session=%p . DataStream: %p -- Packet completely written into send buffer\n", sess, this);
@@ -1442,4 +1537,74 @@ bool MySQL_Data_Stream::data_in_rbio() {
 		return true;
 	}
 	return false;
+}
+
+void MySQL_Data_Stream::get_client_myds_info_json(json& j) {
+	json& jc1 = j["client"];
+	json& jc2 = j["conn"];
+	jc1["stream"]["pkts_recv"] = pkts_recv;
+	jc1["stream"]["pkts_sent"] = pkts_sent;
+	jc1["stream"]["bytes_recv"] = bytes_info.bytes_recv;
+	jc1["stream"]["bytes_sent"] = bytes_info.bytes_sent;
+	jc1["client_addr"]["address"] = ( addr.addr ? addr.addr : "" );
+	jc1["client_addr"]["port"] = addr.port;
+	jc1["proxy_addr"]["address"] = ( proxy_addr.addr ? proxy_addr.addr : "" );
+	jc1["proxy_addr"]["port"] = proxy_addr.port;
+	jc1["encrypted"] = encrypted;
+	if (encrypted) {
+		const SSL_CIPHER *cipher = SSL_get_current_cipher(ssl);
+		if (cipher) {
+			const char * name = SSL_CIPHER_get_name(cipher);
+			if (name) {
+				j["ssl_cipher"] = name;
+			}
+		}
+	}
+	jc1["DSS"] = DSS;
+	jc1["switching_auth_sent"] = switching_auth_sent;
+	jc1["switching_auth_type"] = switching_auth_type;
+	jc1["prot"]["sent_auth_plugin_id"] = myprot.sent_auth_plugin_id;
+	jc1["prot"]["auth_plugin_id"] = myprot.auth_plugin_id;
+
+	switch (myprot.auth_plugin_id) {
+		case AUTH_MYSQL_NATIVE_PASSWORD:
+			jc1["prot"]["auth_plugin"] = "mysql_native_password";
+			break;
+		case AUTH_MYSQL_CLEAR_PASSWORD:
+			jc1["prot"]["auth_plugin"] = "mysql_clear_password";
+			break;
+		case AUTH_MYSQL_CACHING_SHA2_PASSWORD:
+			jc1["prot"]["auth_plugin"] = "caching_sha2_password";
+			break;
+		default:
+			break;
+	}
+	if (myconn != NULL) { // only if myconn is defined
+		if (myconn->userinfo != NULL) { // only if userinfo is defined
+			jc1["userinfo"]["username"]   = ( myconn->userinfo->username   ? myconn->userinfo->username   : "" );
+			jc1["userinfo"]["schemaname"] = ( myconn->userinfo->schemaname ? myconn->userinfo->schemaname : "" );
+#ifdef DEBUG
+			jc1["userinfo"]["password"]   = ( myconn->userinfo->password   ? myconn->userinfo->password   : "" );
+#endif
+		}
+		jc2["session_track_gtids"] = ( myconn->options.session_track_gtids ? myconn->options.session_track_gtids : "") ;
+		for (auto idx = 0; idx < SQL_NAME_LAST_LOW_WM; idx++) {
+			myconn->variables[idx].fill_client_internal_session(jc2, idx);
+		}
+		{
+			for (std::vector<uint32_t>::const_iterator it_c = myconn->dynamic_variables_idx.begin(); it_c != myconn->dynamic_variables_idx.end(); it_c++) {
+				myconn->variables[*it_c].fill_client_internal_session(jc2, *it_c);
+			}
+		}
+
+		jc2["autocommit"] = ( myconn->options.autocommit ? "ON" : "OFF" );
+		jc2["client_flag"]["value"] = myconn->options.client_flag;
+		jc2["client_flag"]["client_found_rows"] = (myconn->options.client_flag & CLIENT_FOUND_ROWS ? 1 : 0);
+		jc2["client_flag"]["client_multi_statements"] = (myconn->options.client_flag & CLIENT_MULTI_STATEMENTS ? 1 : 0);
+		jc2["client_flag"]["client_multi_results"] = (myconn->options.client_flag & CLIENT_MULTI_RESULTS ? 1 : 0);
+		jc2["client_flag"]["client_deprecate_eof"] = (myconn->options.client_flag & CLIENT_DEPRECATE_EOF ? 1 : 0);
+		jc2["no_backslash_escapes"] = myconn->options.no_backslash_escapes;
+		jc2["status"]["compression"] = myconn->get_status(STATUS_MYSQL_CONNECTION_COMPRESSION);
+		jc2["ps"]["client_stmt_to_global_ids"] = myconn->local_stmts->client_stmt_to_global_ids;
+	}
 }

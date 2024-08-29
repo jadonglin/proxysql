@@ -1,14 +1,6 @@
-std::vector<std::string> split(const std::string& s, char delimiter)
-{
-	std::vector<std::string> tokens;
-	std::string token;
-	std::istringstream tokenStream(s);
-	while (std::getline(tokenStream, token, delimiter))
-	{
-		tokens.push_back(token);
-	}
-	return tokens;
-}
+#include <iostream>
+#include <vector>
+#include "json.hpp"
 
 using nlohmann::json;
 
@@ -21,6 +13,17 @@ struct TestCase {
 std::vector<TestCase> testCases;
 
 #define MAX_LINE 10240
+
+#define UNKNOWNVAR	"proxysql_unknown"
+
+const std::vector<std::string> possible_unknown_variables = {
+	"aurora_read_replica_read_committed",
+	"group_replication_consistency",
+	"query_cache_type",
+	"wsrep_osu_method",
+	"log_slow_filter",
+	"sql_quote_show_create",
+	};
 
 int readTestCases(const std::string& fileName) {
 	FILE* fp = fopen(fileName.c_str(), "r");
@@ -97,6 +100,9 @@ int readTestCasesJSON(const std::string& fileName) {
 			}
 		}
 		testCases.push_back({newbuf, vars, reset_vars});
+		if (i%5000 == 0) {
+			fprintf(stderr,"Read %d tests...\n", i);
+		}
 	}
 
 	fclose(fp);
@@ -145,7 +151,13 @@ void parseResult(MYSQL_RES *result, json& j) {
 	unsigned long long nr = mysql_num_rows(result);
 	assert(nr > 16);
 	while ((row = mysql_fetch_row(result))) {
-		j[row[0]] = row[1];
+		if (j.find(row[0]) == j.end()) {
+			j[row[0]] = row[1];
+		} else {
+			if (strcmp(row[1],UNKNOWNVAR)!=0) {
+				j[row[0]] = row[1]; // we override only if the new value it is not UNKNOWNVAR
+			}
+		}
 	}
 }
 
@@ -166,26 +178,26 @@ void dumpResult(MYSQL_RES *result) {
 }
 
 void queryVariables(MYSQL *mysql, json& j, std::string& paddress) {
+	// FIXME:
+	// unify the use of wsrep_sync_wait no matter if Galera is used or not
 	std::stringstream query;
+
 	if (is_mariadb) {
 		query << "SELECT /* mysql " << mysql << " " << paddress << " */ lower(variable_name), variable_value FROM information_schema.session_variables WHERE variable_name IN "
 			" ("
-			" 'sql_safe_updates', 'max_join_size', 'net_write_timeout', 'sql_select_limit', "
-			" 'sql_select_limit', 'character_set_results', 'tx_isolation', 'tx_read_only'";
+			"'tx_isolation', 'tx_read_only', 'max_statement_time'";
 	}
+	else {
+		query << "SELECT /* mysql " << mysql << " " << paddress << " */ * FROM performance_schema.session_variables WHERE variable_name IN "
+			" ("
+			"'session_track_gtids', 'transaction_isolation', 'transaction_read_only', 'max_execution_time'";
+	}
+
 	if (is_cluster) {
-		query << "SELECT /* mysql " << mysql << " " << paddress << " */ * FROM performance_schema.session_variables WHERE variable_name IN "
-			" ("
-			" 'sql_safe_updates', 'session_track_gtids', 'max_join_size', 'net_write_timeout', 'sql_select_limit', "
-			" 'sql_select_limit', 'character_set_results', 'transaction_isolation', 'transaction_read_only', "
-			" 'wsrep_sync_wait'";
+		query << ", 'wsrep_sync_wait'";
 	}
-	if (!is_mariadb && !is_cluster) {
-		query << "SELECT /* mysql " << mysql << " " << paddress << " */ * FROM performance_schema.session_variables WHERE variable_name IN "
-			" ("
-			" 'sql_safe_updates', 'session_track_gtids', 'max_join_size', 'net_write_timeout', 'sql_select_limit', "
-			" 'sql_select_limit', 'character_set_results', 'transaction_isolation', 'transaction_read_only'";
-	}
+	
+	query << ", 'sql_safe_updates', 'max_join_size', 'net_write_timeout', 'sql_select_limit', 'character_set_results'";
 	query << ", 'hostname', 'sql_log_bin', 'sql_mode', 'init_connect', 'time_zone', 'sql_auto_is_null'";
 	query << ", 'sql_auto_is_null', 'collation_connection', 'character_set_connection', 'character_set_client', 'character_set_database', 'group_concat_max_len'";
 	query << ", 'foreign_key_checks', 'unique_checks'";
@@ -194,9 +206,18 @@ void queryVariables(MYSQL *mysql, json& j, std::string& paddress) {
 	query << ", 'innodb_lock_wait_timeout', 'innodb_strict_mode', 'innodb_table_locks'";
 	query << ", 'join_buffer_size', 'lock_wait_timeout'";
 	query << ", 'sort_buffer_size', 'optimizer_switch', 'optimizer_search_depth', 'optimizer_prune_level'";
-	query << ", 'max_execution_time', 'long_query_time', 'tmp_table_size', 'max_heap_table_size'";
+	query << ", 'long_query_time', 'tmp_table_size', 'max_heap_table_size'";
 	query << ", 'lc_messages', 'lc_time_names', 'timestamp', 'max_sort_length', 'sql_big_selects'";
+	// the following variables are likely to not exist on all systems
+	for (std::vector<std::string>::const_iterator it = possible_unknown_variables.begin() ; it != possible_unknown_variables.end() ; it++) {
+		query << ", '" << *it << "'";
+	}
 	query << ")";
+	// the following variables are likely to not exist on all systems
+	// so we artificially add them with an UNION and we will eventually filter them
+	for (std::vector<std::string>::const_iterator it = possible_unknown_variables.begin() ; it != possible_unknown_variables.end() ; it++) {
+		query << " UNION SELECT '" << *it << "','" << std::string(UNKNOWNVAR) << "'";
+	}
 	//fprintf(stderr, "TRACE : QUERY 3 : variables %s\n", query.str().c_str());
 	if (mysql_query(mysql, query.str().c_str())) {
 		if (silent==0) {

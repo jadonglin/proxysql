@@ -25,20 +25,18 @@
  *
  *   By default all types of tests are executed.
  */
-#include <utility>
+#include <cstring>
+#include <iostream>
+#include <fstream>
+#include <chrono>
+#include <random>
 #include <vector>
 #include <string>
-#include <cstring>
-#include <algorithm>
-#include <iostream>
-#include <chrono>
-#include <ctype.h>
-#include <regex>
 
 #include "json.hpp"
 #include "proxysql.h"
 #include "proxysql_utils.h"
-#include "utils.h"
+#include "re2/re2.h"
 #include "command_line.h"
 #include "tap.h"
 
@@ -77,6 +75,8 @@ uint64_t benchmark_parsing(const vector<string>& queries, int mode, uint32_t ite
 	hrc::time_point end;
 
 	vector<char*> results {};
+	vector<char*> comments {};
+
 	char buf[QUERY_DIGEST_BUF];
 
 	start = hrc::now();
@@ -87,11 +87,15 @@ uint64_t benchmark_parsing(const vector<string>& queries, int mode, uint32_t ite
 
 			char* c_res = NULL;
 			if (mode == 0) {
+				diag("Invalid test. mysql_query_digest_and_first_comment() was deprecated in 2.4.0");
+				exit(EXIT_FAILURE);
+/*
 				c_res =
 					mysql_query_digest_and_first_comment(
 						const_cast<char*>(query.c_str()), query.length(), &first_comment,
 						((query.size() < QUERY_DIGEST_BUF) ? buf : NULL)
 					);
+*/
 			} else if (mode == 1) {
 				c_res =
 					mysql_query_digest_and_first_comment_one_it(
@@ -118,12 +122,25 @@ uint64_t benchmark_parsing(const vector<string>& queries, int mode, uint32_t ite
 					);
 			}
 
-			results.push_back(c_res);
+			if (query.size() > QUERY_DIGEST_BUF) {
+				results.push_back(c_res);
+			}
+			if (first_comment != NULL) {
+				comments.push_back(first_comment);
+			}
 		}
 	}
 
 	end = hrc::now();
 	duration = end - start;
+
+	for (char* result : results) {
+		free(result);
+	}
+
+	for (char* comment : comments) {
+		free(comment);
+	}
 
 	return duration.count();
 }
@@ -134,8 +151,10 @@ nlohmann::json get_tests_defs(const string& filepath) {
 	std::ifstream file_stream(filepath);
 	std::string test_file_contents((std::istreambuf_iterator<char>(file_stream)), (std::istreambuf_iterator<char>()));
 
-	std::regex comment_pattern { ".*\\/\\/.*[\\r\\n]" };
-	string test_file_no_comments { std::regex_replace(test_file_contents, comment_pattern, "") };
+	std::string comment_pattern { ".*\\/\\/.*[\\r\\n]" };
+	string test_file_no_comments { test_file_contents };
+
+	re2::RE2::GlobalReplace(&test_file_no_comments, comment_pattern, "");
 	nlohmann::json j_test_defs = nlohmann::json::parse(test_file_no_comments, nullptr, true);
 
 	return j_test_defs;
@@ -765,7 +784,7 @@ int main(int argc, char** argv) {
 			exec_grouping_tests = false;
 		}
 		if (tests_filter_str.find("regular") == std::string::npos) {
-			exec_grouping_tests = false;
+			exec_regular_tests = false;
 		}
 	}
 

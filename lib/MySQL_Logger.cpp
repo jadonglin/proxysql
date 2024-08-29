@@ -18,7 +18,7 @@ using json = nlohmann::json;
 #else
 #define DEB ""
 #endif /* DEBUG */
-#define PROXYSQL_MYSQL_LOGGER_VERSION "2.0.0714" DEB
+#define PROXYSQL_MYSQL_LOGGER_VERSION "2.5.0421" DEB
 
 extern MySQL_Logger *GloMyLogger;
 
@@ -56,18 +56,38 @@ MySQL_Event::MySQL_Event (log_event_type _et, uint32_t _thread_id, char * _usern
 	extra_info = NULL;
 	have_affected_rows=false;
 	affected_rows=0;
+	last_insert_id = 0;
 	have_rows_sent=false;
+	have_gtid=false;
 	rows_sent=0;
+	client_stmt_id=0;
+	gtid = NULL;
 }
 
-void MySQL_Event::set_affected_rows(uint64_t ar) {
+void MySQL_Event::set_client_stmt_id(uint32_t client_stmt_id) {
+	this->client_stmt_id = client_stmt_id;
+}
+
+// if affected rows is set, last_insert_id is set too.
+// They are part of the same OK packet
+void MySQL_Event::set_affected_rows(uint64_t ar, uint64_t lid) {
 	have_affected_rows=true;
 	affected_rows=ar;
+	last_insert_id=lid;
 }
 
 void MySQL_Event::set_rows_sent(uint64_t rs) {
 	have_rows_sent=true;
 	rows_sent=rs;
+}
+
+void MySQL_Event::set_gtid(MySQL_Session *sess) {
+	if (sess != NULL) {
+		if (sess->gtid_buf[0] != 0) {
+			have_gtid = true;
+			gtid = sess->gtid_buf;
+		}
+	}
 }
 
 void MySQL_Event::set_extra_info(char *_err) {
@@ -119,7 +139,7 @@ uint64_t MySQL_Event::write(std::fstream *f, MySQL_Session *sess) {
 }
 
 void MySQL_Event::write_auth(std::fstream *f, MySQL_Session *sess) {
-	json j;
+	json j = {};
 	j["timestamp"] = start_time/1000;
 	{
 		time_t timer=start_time/1000/1000;
@@ -257,7 +277,9 @@ uint64_t MySQL_Event::write_query_format_1(std::fstream *f) {
 
 	total_bytes+=mysql_encode_length(start_time,NULL);
 	total_bytes+=mysql_encode_length(end_time,NULL);
+	total_bytes+=mysql_encode_length(client_stmt_id,NULL);
 	total_bytes+=mysql_encode_length(affected_rows,NULL);
+	total_bytes+=mysql_encode_length(last_insert_id,NULL); // as in MySQL Protocol, last_insert_id is immediately after affected_rows
 	total_bytes+=mysql_encode_length(rows_sent,NULL);
 
 	total_bytes+=mysql_encode_length(query_digest,NULL);
@@ -314,8 +336,18 @@ uint64_t MySQL_Event::write_query_format_1(std::fstream *f) {
 	write_encoded_length(buf,end_time,len,buf[0]);
 	f->write((char *)buf,len);
 
+	if (et == PROXYSQL_COM_STMT_PREPARE || et == PROXYSQL_COM_STMT_EXECUTE) {
+		len=mysql_encode_length(client_stmt_id,buf);
+		write_encoded_length(buf,client_stmt_id,len,buf[0]);
+		f->write((char *)buf,len);
+	}
+
 	len=mysql_encode_length(affected_rows,buf);
 	write_encoded_length(buf,affected_rows,len,buf[0]);
+	f->write((char *)buf,len);
+
+	len=mysql_encode_length(last_insert_id,buf);
+	write_encoded_length(buf,last_insert_id,len,buf[0]);
 	f->write((char *)buf,len);
 
 	len=mysql_encode_length(rows_sent,buf);
@@ -337,7 +369,7 @@ uint64_t MySQL_Event::write_query_format_1(std::fstream *f) {
 }
 
 uint64_t MySQL_Event::write_query_format_2_json(std::fstream *f) {
-	json j;
+	json j = {};
 	uint64_t total_bytes=0;
 	if (hid!=UINT64_MAX) {
 		j["hostgroup_id"] = hid;
@@ -358,26 +390,40 @@ uint64_t MySQL_Event::write_query_format_2_json(std::fstream *f) {
 	}
 	if (username) {
 		j["username"] = username;
-	} else {
-		j["username"] = "";
+	//} else {
+	//	j["username"] = "";
 	}
 	if (schemaname) {
 		j["schemaname"] = schemaname;
-	} else {
-		j["schemaname"] = "";
+	//} else {
+	//	j["schemaname"] = "";
 	}
 	if (client) {
 		j["client"] = client;
-	} else {
-		j["client"] = "";
+	//} else {
+	//	j["client"] = "";
 	}
 	if (hid!=UINT64_MAX) {
 		if (server) {
 			j["server"] = server;
 		}
 	}
-	j["rows_affected"] = affected_rows;
-	j["rows_sent"] = rows_sent;
+	if (have_affected_rows == true) {
+		// in JSON format we only log rows_affected and last_insert_id
+		// if they are present.
+		// rows_affected is logged also if 0, while
+		// last_insert_id is log logged if 0
+		j["rows_affected"] = affected_rows;
+		if (last_insert_id != 0) {
+			j["last_insert_id"] = last_insert_id;
+		}
+	}
+	if (have_rows_sent == true) {
+		j["rows_sent"] = rows_sent;
+	}
+	if (have_gtid == true) {
+		j["last_gtid"] = gtid;
+	}
 	j["query"] = string(query_ptr,query_len);
 	j["starttime_timestamp_us"] = start_time;
 	{
@@ -405,6 +451,10 @@ uint64_t MySQL_Event::write_query_format_2_json(std::fstream *f) {
 	char digest_hex[20];
 	sprintf(digest_hex,"0x%016llX", (long long unsigned int)query_digest);
 	j["digest"] = digest_hex;
+
+	if (et == PROXYSQL_COM_STMT_PREPARE || et == PROXYSQL_COM_STMT_EXECUTE) {
+		j["client_stmt_id"] = client_stmt_id;
+	}
 
 	// for performance reason, we are moving the write lock
 	// right before the write to disk
@@ -526,7 +576,7 @@ void MySQL_Logger::events_open_log_unlocked() {
 		events.logfile->open(filen , std::ios::out | std::ios::binary);
 		proxy_info("Starting new mysql event log file %s\n", filen);
 	}
-	catch (std::ofstream::failure e) {
+	catch (const std::ofstream::failure&) {
 		proxy_error("Error creating new mysql event log file %s\n", filen);
 		delete events.logfile;
 		events.logfile=NULL;
@@ -555,7 +605,7 @@ void MySQL_Logger::audit_open_log_unlocked() {
 		audit.logfile->open(filen , std::ios::out | std::ios::binary);
 		proxy_info("Starting new audit log file %s\n", filen);
 	}
-	catch (std::ofstream::failure e) {
+	catch (const std::ofstream::failure&) {
 		proxy_error("Error creating new audit log file %s\n", filen);
 		delete audit.logfile;
 		audit.logfile=NULL;
@@ -626,6 +676,9 @@ void MySQL_Logger::audit_set_datadir(char *s) {
 void MySQL_Logger::log_request(MySQL_Session *sess, MySQL_Data_Stream *myds) {
 	if (events.enabled==false) return;
 	if (events.logfile==NULL) return;
+	// 'MySQL_Session::client_myds' could be NULL in case of 'RequestEnd' being called over a freshly created session
+	// due to a failed 'CONNECTION_RESET'. Because this scenario isn't a client request, we just return.
+	if (sess->client_myds==NULL || sess->client_myds->myconn== NULL) return;
 
 	MySQL_Connection_userinfo *ui=sess->client_myds->myconn->userinfo;
 
@@ -652,7 +705,7 @@ void MySQL_Logger::log_request(MySQL_Session *sess, MySQL_Data_Stream *myds) {
 			break;
 		case WAITING_CLIENT_DATA:
 			{
-				unsigned char c=*((unsigned char *)sess->pktH->ptr+sizeof(mysql_hdr));
+				unsigned char c=*((unsigned char *)sess->pkt.ptr+sizeof(mysql_hdr));
 				switch ((enum_mysql_command)c) {
 					case _MYSQL_COM_STMT_PREPARE:
 						// proxysql is responding to COM_STMT_PREPARE without
@@ -667,11 +720,20 @@ void MySQL_Logger::log_request(MySQL_Session *sess, MySQL_Data_Stream *myds) {
 		default:
 			break;
 	}
+
+	uint64_t query_digest = 0;
+
+	if (sess->status != PROCESSING_STMT_EXECUTE) {
+		query_digest = GloQPro->get_digest(&sess->CurrentQuery.QueryParserArgs);
+	} else {
+		query_digest = sess->CurrentQuery.stmt_info->digest;
+	}
+
 	MySQL_Event me(let,
 		sess->thread_session_id,ui->username,ui->schemaname,
 		sess->CurrentQuery.start_time + curtime_real - curtime_mono,
 		sess->CurrentQuery.end_time + curtime_real - curtime_mono,
-		GloQPro->get_digest(&sess->CurrentQuery.QueryParserArgs),
+		query_digest,
 		ca, cl
 	);
 	char *c = NULL;
@@ -680,11 +742,18 @@ void MySQL_Logger::log_request(MySQL_Session *sess, MySQL_Data_Stream *myds) {
 		case PROCESSING_STMT_EXECUTE:
 			c = (char *)sess->CurrentQuery.stmt_info->query;
 			ql = sess->CurrentQuery.stmt_info->query_length;
+			me.set_client_stmt_id(sess->CurrentQuery.stmt_client_id);
 			break;
 		case PROCESSING_STMT_PREPARE:
 		default:
 			c = (char *)sess->CurrentQuery.QueryPointer;
 			ql = sess->CurrentQuery.QueryLength;
+			// NOTE: This needs to be located in the 'default' case because otherwise will miss state
+			// 'WAITING_CLIENT_DATA'. This state is possible when the prepared statement is found in the
+			// global cache and due to that we immediately reply to the client and session doesn't reach
+			// 'PROCESSING_STMT_PREPARE' state. 'stmt_client_id' is expected to be '0' for anything that isn't
+			// a prepared statement, still, logging should rely 'log_event_type' instead of this value.
+			me.set_client_stmt_id(sess->CurrentQuery.stmt_client_id);
 			break;
 	}
 	if (c) {
@@ -694,9 +763,10 @@ void MySQL_Logger::log_request(MySQL_Session *sess, MySQL_Data_Stream *myds) {
 	}
 
 	if (sess->CurrentQuery.have_affected_rows) {
-		me.set_affected_rows(sess->CurrentQuery.affected_rows);
+		me.set_affected_rows(sess->CurrentQuery.affected_rows, sess->CurrentQuery.last_insert_id);
 	}
 	me.set_rows_sent(sess->CurrentQuery.rows_sent);
+	me.set_gtid(sess);
 
 	int sl=0;
 	char *sa=(char *)""; // default
